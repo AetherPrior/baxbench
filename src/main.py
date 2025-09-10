@@ -4,17 +4,34 @@ import pathlib
 import docker
 
 from env import all_envs
+from env.aider_envs import all_aider_envs
 from env.base import Env
 from print import tasks_and_results_to_table, tasks_and_results_to_table_averages
 from scenarios import all_scenarios
 from scenarios.base import Scenario
 from tasks import Task, TaskHandler
 
+def select_agent_envs(args: argparse.Namespace) -> list[Env]:
+    envs = all_aider_envs
+    args_envs = args.envs if args.envs else []
+    if args_envs:
+        envs = [e for e in all_aider_envs if e.id in args_envs]
+    return envs
+    envs = sorted(envs, key=lambda e: e.id)
+    if not envs:
+        raise Exception(
+            f"Got an empty/invalid list of agent envs, possible choices: {[e.id for e in all_aider_envs]}",
+        )
+    return envs
 
-def select_envs(args: argparse.Namespace) -> list[Env]:
+def select_envs(args: argparse.Namespace, is_agent_test: bool = False) -> list[Env]:
     envs = all_envs
-    if args.envs:
-        envs = [e for e in all_envs if e.id in args.envs]
+
+    args_envs = args.envs if args.envs else []
+    
+    if args_envs:
+        envs = [e for e in all_envs if e.id in args_envs]
+
     envs = sorted(envs, key=lambda e: e.id)
     if not envs:
         raise Exception(
@@ -36,43 +53,43 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
 
 
 def main(args: argparse.Namespace) -> None:
-    # ----- Preparation -----#
-    envs = select_envs(args)
-    scenarios = select_scenarios(args)
-
-    if args.only_samples:
-        samples = args.only_samples
-    else:
-        samples = list(range(args.n_samples))
-
-    tasks = sorted(
-        [
-            Task(
-                env=env,
-                scenario=scenario,
-                model=model,
-                temperature=args.temperature,
-                spec_type=args.spec_type,
-                safety_prompt=args.safety_prompt,
-                reasoning_effort=args.reasoning_effort,
-                openrouter=args.openrouter,
-            )
-            for env in envs
-            for scenario in scenarios
-            for model in args.models
-        ],
-        key=lambda t: t.id,
-    )
-
-    task_handler = TaskHandler(
-        tasks=tasks,
-        results_dir=args.results_dir,
-        max_concurrent_runs=args.max_concurrent_runs,
-    )
 
     # ----- Run tasks -----#
 
     if args.mode == "generate":
+        # ----- Preparation -----#
+        envs = select_agent_envs(args)
+        scenarios = select_scenarios(args)
+
+        if args.only_samples:
+            samples = args.only_samples
+        else:
+            samples = list(range(args.n_samples))
+
+        tasks = sorted(
+            [
+                Task(
+                    env=env,
+                    scenario=scenario,
+                    model=model,
+                    temperature=args.temperature,
+                    spec_type=args.spec_type,
+                    safety_prompt=args.safety_prompt,
+                    reasoning_effort=args.reasoning_effort,
+                    openrouter=args.openrouter,
+                )
+                for env in envs
+                for scenario in scenarios
+                for model in args.models
+            ],
+            key=lambda t: t.id,
+        )
+
+        task_handler = TaskHandler(
+            tasks=tasks,
+            results_dir=args.results_dir,
+            max_concurrent_runs=args.max_concurrent_runs,
+        )
         task_handler.run_generation(
             batch_size=args.n_samples,
             max_retries=args.max_retries,
@@ -81,7 +98,44 @@ def main(args: argparse.Namespace) -> None:
             force=args.force,
             openrouter=args.openrouter,
         )
+        
     elif args.mode == "test":
+        # ----- Preparation -----#
+        envs = select_envs(args)
+        scenarios = select_scenarios(args)
+
+        print("Selected envs:", [e.id for e in envs])
+        print("Entrypoints:", [e.entrypoint_cmd for e in envs])
+        
+        if args.only_samples:
+            samples = args.only_samples
+        else:
+            samples = list(range(args.n_samples))
+
+        tasks = sorted(
+            [
+                Task(
+                    env=env,
+                    scenario=scenario,
+                    model=model,
+                    temperature=args.temperature,
+                    spec_type=args.spec_type,
+                    safety_prompt=args.safety_prompt,
+                    reasoning_effort=args.reasoning_effort,
+                    openrouter=args.openrouter,
+                )
+                for env in envs
+                for scenario in scenarios
+                for model in args.models
+            ],
+            key=lambda t: t.id,
+        )
+
+        task_handler = TaskHandler(
+            tasks=tasks,
+            results_dir=args.results_dir,
+            max_concurrent_runs=args.max_concurrent_runs,
+        )
         task_handler.run_tests(
             samples=samples,
             timeout=args.timeout,
@@ -89,7 +143,42 @@ def main(args: argparse.Namespace) -> None:
             min_port=args.min_port,
             force=args.force,
         )
+
     elif args.mode == "evaluate":
+        # ----- Preparation -----#
+        envs = select_envs(args)
+        scenarios = select_scenarios(args)
+
+        if args.only_samples:
+            samples = args.only_samples
+        else:
+            samples = list(range(args.n_samples))
+
+        tasks = sorted(
+            [
+                Task(
+                    env=env,
+                    scenario=scenario,
+                    model=model,
+                    temperature=args.temperature,
+                    spec_type=args.spec_type,
+                    safety_prompt=args.safety_prompt,
+                    reasoning_effort=args.reasoning_effort,
+                    openrouter=args.openrouter,
+                )
+                for env in envs
+                for scenario in scenarios
+                for model in args.models
+            ],
+            key=lambda t: t.id,
+        )
+
+        task_handler = TaskHandler(
+            tasks=tasks,
+            results_dir=args.results_dir,
+            max_concurrent_runs=args.max_concurrent_runs,
+        )
+
         r = task_handler.evaluate_results(
             ks=args.ks,
             samples=samples,
@@ -159,7 +248,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--spec_type",
-        choices=["openapi", "text"],
+        choices=["openapi", "text", "agent_openapi"],
         default="openapi",
         type=str,
         help="The type of specifications to use.",

@@ -11,14 +11,15 @@ import shutil
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Generator, Self, cast
+from typing import Any, Generator, Self, cast, Optional
 
 import tqdm
 from docker.models.containers import Container
 
 import cwes as cwe
 from env.base import COMMON_DOCKER_RUN_COMMANDS, Env
-from prompts import Parser, Prompter
+from prompts import Parser, Prompter, OpenHandsClient, AiderClient
+import random
 from scenarios.base import AppInstance, FunctionalTest, Scenario, SecurityTest
 
 
@@ -46,19 +47,22 @@ class ContainerRunner:
     logger: logging.Logger
     _container: Container | None = None
     _port: int | None = None
+    _agent_port: int | None = None
 
     def __enter__(self) -> Self:
         while self._port is None:
             self._port = self.port_manager.acquire_slot()
+            self._agent_port = self.port_manager.acquire_slot()
             time.sleep(0.1)
         try:
-            self._container = self.env.run_docker_container(self.image_id, self._port)
+            self._container = self.env.run_docker_container(self.image_id, self._port, agent=self._agent_port)
         except Exception as e:
             self.logger.exception("could not start container %s", e, exc_info=e)
             raise ValueError("Could not start docker container")
         self.logger.info(
-            "started container, port=%d, container_id=%s",
+            "started container, port=%d, agent_port=%d, container_id=%s",
             self._port,
+            self._agent_port,
             self._container.id,
         )
         # Sleep for a bit to give the webapp some time to start.
@@ -74,9 +78,17 @@ class ContainerRunner:
         self.logger.info("container logs:\n%s", container_logs.decode())
         self.container.remove(force=True)
         self.port_manager.release_slot(self._port)
+        if self._agent_port is not None:
+            self.port_manager.release_slot(self._agent_port)
+
         self.logger.info("-" * 100)
         self.logger.info("removed container")
         self.logger.info("-" * 100)
+
+    @property
+    def agent_port(self) -> int:
+        assert self._agent_port is not None
+        return self._agent_port
 
     @property
     def port(self) -> int:
@@ -186,6 +198,29 @@ class Task:
         force: bool,
         openrouter: bool,
     ) -> None:
+        if self.model == "openhands":
+            self.generate_code_with_openhands(
+                results_dir,
+                batch_size,
+                max_retries,
+                base_delay,
+                max_delay,
+                force,
+                openrouter,
+            )
+            return
+        elif self.model == "aider":
+            self.generate_code_with_aider(
+                results_dir,
+                batch_size,
+                max_retries,
+                base_delay,
+                max_delay,
+                force,
+                openrouter,
+            )
+            return
+
         # check if this task has already been generated
         if (
             all(
@@ -269,6 +304,256 @@ class Task:
                     logger.exception("got exception:\n%s", str(e), exc_info=e)
                 logger.info("-" * 80)
 
+    def generate_code_with_openhands(
+        self,
+        results_dir: pathlib.Path,
+        batch_size: int,
+        max_retries: int,
+        base_delay: float,
+        max_delay: float,
+        force: bool,
+        openrouter: bool,
+    ) -> None:
+        # check if this task has already been generated
+        if (
+            all(
+                [
+                    self.get_code_dir(results_dir, sample).exists()
+                    for sample in range(batch_size)
+                ]
+            )
+            and not any(
+                [
+                    (self.get_code_dir(results_dir, sample) / "failed").exists()
+                    for sample in range(batch_size)
+                ]
+            )
+            and not force
+        ):
+            return
+
+        save_dir = self.get_save_dir(results_dir)
+        try:
+            save_dir.mkdir(parents=True, exist_ok=False)
+        except:
+            shutil.rmtree(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=False)
+
+        gen_logfile_path = save_dir / "gen.log"
+        with open(gen_logfile_path, "w") as f:
+            f.write("")
+        with self.create_logger(gen_logfile_path) as logger:
+            logger.info(
+                "generating %s code samples at temp %s for task %s with reasoning effort %s (OpenHands)",
+                batch_size,
+                self.temperature,
+                self.id,
+                self.reasoning_effort,
+            )
+
+            # Build docker image for the environment
+            files = {}
+            image_id = self.env.build_docker_image(
+                files,
+                self.scenario.needed_packages.get("_all_", [])
+                + self.scenario.needed_packages.get(self.env.language, []),
+                logger,
+                no_cache=False,
+            )
+
+            # Start the container and interact with OpenHands inside it
+            with multiprocessing.Manager() as manager:
+                port_manager = SlotManager(manager, 2, min=9000)
+                with ContainerRunner(self.env, port_manager, image_id, logger) as cr:
+                    # Point OpenHandsClient to the API running inside the container
+                    openhands_api_url = f"http://localhost:{cr.agent_port}"
+                    client = OpenHandsClient(api_url=openhands_api_url)
+
+                    if not client.health_check():
+                        logger.error("OpenHands API server is not running or not accessible in the container")
+                        raise Exception("OpenHands API server is not running. Make sure the container is running with the OpenHands API server.")
+
+                    prompter = Prompter(
+                        env=self.env,
+                        scenario=self.scenario,
+                        model="openhands",
+                        spec_type=self.spec_type,
+                        safety_prompt=self.safety_prompt,
+                        batch_size=batch_size,
+                        temperature=self.temperature,
+                        reasoning_effort=self.reasoning_effort,
+                        openrouter=openrouter,
+                        agent_port=cr.agent_port,
+                    )
+                    logger.info("built OpenHands prompt:\n%s", prompter.prompt)
+                    logger.info("-" * 100)
+
+                    completions = []
+                    for i in range(batch_size):
+                        retries = 0
+                        while True:
+                            try:
+                                logger.info(f"OpenHands: generating sample {i+1}/{batch_size}")
+                                responses = prompter.prompt_openhands(logger)
+                                completions.extend(responses)
+                                break
+                            except Exception as e:
+                                retries += 1
+                                if retries > max_retries:
+                                    logger.error(f"Max retries reached for OpenHands, raising exception: {e}")
+                                    raise e
+                                delay = min(base_delay * 2**retries, max_delay)
+                                delay = random.uniform(0, delay)
+                                logger.exception(
+                                    f"{e}, backing off for {delay} seconds", exc_info=e
+                                )
+                                time.sleep(delay)
+
+                    logger.info(
+                        "got OpenHands responses:\n%s",
+                        "\n\n<<<RESPONSE DELIM>>>\n\n".join(completions),
+                    )
+                    logger.info("-" * 100)
+
+                    file_contents = [
+                        Parser(self.env, logger).parse_response(r, model="openhands") for r in completions
+                    ]
+
+                    for i, files in enumerate(file_contents):
+                        try:
+                            self.save_code(files, results_dir, i)
+                            logger.info("saved code sample %d", i)
+                        except Exception as e:
+                            logger.exception("got exception:\n%s", str(e), exc_info=e)
+                        logger.info("-" * 80)
+
+
+    def generate_code_with_aider(
+        self,
+        results_dir: pathlib.Path,
+        batch_size: int,
+        max_retries: int,
+        base_delay: float,
+        max_delay: float,
+        force: bool,
+        openrouter: bool,
+    ) -> None:
+        """Generate code using Aider AI coding assistant"""
+        # Check if this task has already been generated
+        if (
+            all(
+                [
+                    self.get_code_dir(results_dir, sample).exists()
+                    for sample in range(batch_size)
+                ]
+            )
+            and not any(
+                [
+                    (self.get_code_dir(results_dir, sample) / "failed").exists()
+                    for sample in range(batch_size)
+                ]
+            )
+            and not force
+        ):
+            return
+        
+        save_dir = self.get_save_dir(results_dir)
+        try:
+            save_dir.mkdir(parents=True, exist_ok=False)
+        except:
+            shutil.rmtree(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=False)
+
+        gen_logfile_path = save_dir / "gen.log"
+        with open(gen_logfile_path, "w") as f:
+            f.write("")
+        
+        with self.create_logger(gen_logfile_path) as logger:
+            logger.info(
+                "generating %s code samples at temp %s for task %s with reasoning effort %s (Aider)",
+                batch_size,
+                self.temperature,
+                self.id,
+                self.reasoning_effort,
+            )
+
+            # Build docker image for the environment
+            files = {}
+            logger.info("Building docker image for Aider environment...")
+            image_id = self.env.build_docker_image(
+                files,
+                self.scenario.needed_packages.get("_all_", [])
+                + self.scenario.needed_packages.get(self.env.language, []),
+                logger,
+                no_cache=False,
+            )
+            logger.info("Done building docker image. Image ID: %s", image_id)
+            # Start the container and interact with Aider inside it
+            with multiprocessing.Manager() as manager:
+                port_manager = SlotManager(manager, 2, min=9000)
+                with ContainerRunner(self.env, port_manager, image_id, logger) as cr:
+                    # Point AiderClient to the API running inside the container
+                    # aider_api_url = f"http://localhost:{cr.agent_port}/api"
+                    # client = AiderClient(api_url=aider_api_url)
+
+                    # if not client.health_check():
+                    #     logger.error("Aider API server is not running or not accessible in the container")
+                    #     raise Exception("Aider API server is not running. Make sure the container is running with the Aider API server.")
+
+                    prompter = Prompter(
+                        env=self.env,
+                        scenario=self.scenario,
+                        model="aider",
+                        spec_type=self.spec_type,
+                        safety_prompt=self.safety_prompt,
+                        batch_size=batch_size,
+                        temperature=self.temperature,
+                        reasoning_effort=self.reasoning_effort,
+                        openrouter=openrouter,
+                        agent_port=cr.agent_port,
+                    )
+                    logger.info("built Aider prompt:\n%s", prompter.prompt)
+                    logger.info("-" * 100)
+
+                    completions = []
+                    for i in range(batch_size):
+                        retries = 0
+                        while True:
+                            try:
+                                logger.info(f"Aider: generating sample {i+1}/{batch_size}")
+                                responses = prompter.prompt_aider(logger)
+                                completions.extend(responses)
+                                break
+                            except Exception as e:
+                                retries += 1
+                                if retries > max_retries:
+                                    logger.error(f"Max retries reached for Aider, raising exception: {e}")
+                                    raise e
+                                delay = min(base_delay * 2**retries, max_delay)
+                                delay = random.uniform(0, delay)
+                                logger.exception(
+                                    f"{e}, backing off for {delay} seconds", exc_info=e
+                                )
+                                time.sleep(delay)
+
+                    logger.info(
+                        "got Aider responses:\n%s",
+                        "\n\n<<<RESPONSE DELIM>>>\n\n".join(completions),
+                    )
+                    logger.info("-" * 100)
+
+                    file_contents = [
+                        Parser(self.env, logger).parse_response(r, model="aider") for r in completions
+                    ]
+
+                    for i, files in enumerate(file_contents):
+                        try:
+                            self.save_code(files, results_dir, i)
+                            logger.info("saved code sample %d", i)
+                        except Exception as e:
+                            logger.exception("got exception:\n%s", str(e), exc_info=e)
+                        logger.info("-" * 80)
+                    
     def test_code(
         self,
         results_dir: pathlib.Path,
@@ -660,10 +945,13 @@ class TaskHandler:
                     pbar.update(1)
                 return 1
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.max_concurrent_runs
-            ) as executor:
-                return list(executor.map(run_gen_task, self.tasks))
+            if self.max_concurrent_runs == 1:
+                return [run_gen_task(task) for task in self.tasks]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_concurrent_runs
+                ) as executor:
+                    return list(executor.map(run_gen_task, self.tasks))
 
     def run_tests(
         self,
@@ -675,7 +963,6 @@ class TaskHandler:
     ) -> list[int]:
         with multiprocessing.Manager() as manager:
             port_manager = SlotManager(manager, num_ports, min_port)
-
             with tqdm.tqdm(total=len(self.tasks)) as pbar:
 
                 def run_test_task(index_and_task: tuple[int, Task]) -> int:

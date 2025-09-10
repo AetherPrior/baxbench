@@ -5,11 +5,11 @@ import tarfile
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, cast
-
+from functools import partial
 import docker
 import docker.errors
 from docker.models.containers import Container
-
+import os
 _docker_client = docker.from_env()
 
 
@@ -48,6 +48,9 @@ class Env:
     # The model will be asked to make the app listen on this port.
     port: int = 5000
 
+    # agent port
+    agent_port: int = 3000
+
     # How much time (in seconds) we should wait for the app in the container to start.
     wait_to_start_time: float = 2.0
 
@@ -68,6 +71,28 @@ class Env:
             return False
         return self.id < other.id
 
+    def _format_dockerfile(
+        self, entrypoint_cmd: str, additional_docker_commands: list[str]
+    ) -> str:
+        # check if openai_api_key is part of self.dockerfile format string
+        try:
+            return self.dockerfile.format(
+                entrypoint_cmd=entrypoint_cmd,
+                additional_commands="\n".join([f"RUN {cmd}" for cmd in additional_docker_commands]),
+            )
+        except KeyError as e:
+            
+            additional_docker_commands = [] # as we actually specify our dockerfile here
+
+            return self.dockerfile.format(
+                entrypoint_cmd=entrypoint_cmd,
+                additional_commands="\n".join([f"RUN {cmd}" for cmd in additional_docker_commands]), 
+                openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+                anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+                deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+                openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
+            )
+            
     def build_docker_image(
         self,
         files: dict[pathlib.Path, str],
@@ -77,11 +102,9 @@ class Env:
     ) -> str:
         logger.info("building the Docker image")
         tar_stream = io.BytesIO()
-        final_dockerfile = self.dockerfile.format(
+        final_dockerfile = self._format_dockerfile(
             entrypoint_cmd=self.entrypoint_cmd,
-            additional_commands="\n".join(
-                [f"RUN {cmd}" for cmd in additional_docker_commands]
-            ),
+            additional_docker_commands=additional_docker_commands
         )
         with tarfile.open(fileobj=tar_stream, mode="w") as tar:
 
@@ -105,6 +128,7 @@ class Env:
         # Build the Docker image using the tar file.
         lang, frw = self.language.replace("-", "_"), self.framework.replace("-", "_")
         tag = f"bax_bench_{lang}_{frw}".lower()
+        
         r = _docker_client.images.build(
             fileobj=tar_stream,
             nocache=no_cache,
@@ -120,7 +144,7 @@ class Env:
             raise Exception(f"got a None image id: {r}")
         return r[0].id
 
-    def run_docker_container(self, image_id: str, use_port: int) -> Container:
+    def run_docker_container(self, image_id: str, use_port: int, agent: int) -> Container:
         uid = uuid.uuid4()
         return cast(
             Container,
@@ -128,7 +152,7 @@ class Env:
                 image_id,
                 name=f"bax_bench_{uid}",
                 detach=True,
-                ports={f"{self.port}/tcp": use_port},
+                ports={f"{self.port}/tcp": use_port, f"{self.agent_port}/tcp": agent},
                 auto_remove=False,
                 # Set the memory limit to 1GB.
                 mem_limit=2**30,
