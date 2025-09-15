@@ -156,6 +156,9 @@ class Env:
                 auto_remove=False,
                 # Set the memory limit to 1GB.
                 mem_limit=2**30,
+                volumes={
+                    "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}  # Docker access
+                }
             ),
         )
 

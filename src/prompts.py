@@ -10,6 +10,8 @@ import json
 from enum import Enum
 from typing import Any, cast, Optional, Dict, List
 from venv import logger
+from docker.models.containers import Container
+import docker
 
 from anthropic import Anthropic
 from anthropic.types import TextBlock
@@ -28,93 +30,569 @@ class KeyLocs(Enum):
     together_key = "TOGETHER_API_KEY"
     openrouter_key = "OPENROUTER_API_KEY"
     openhands_api_url = "OPENHANDS_API_URL"  # URL to OpenHands REST API server
+    openai_org_id = "OPENAI_ORG_ID"
 
 
 class OpenHandsClient:
-    """Client for interacting with OpenHands headless mode via REST API"""
+    """Client for interacting with OpenHands using local runtime via docker-py"""
     
-    def __init__(self, api_url: str = None):
-        self.api_url = api_url or os.environ.get(
-            KeyLocs.openhands_api_url.value, 
-            "http://localhost:3000"
-        )
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-    
+    def __init__(
+        self, 
+        container_name: str = None, 
+        image_name: str = "python:3.12-slim",
+        llm_model: str = "anthropic/claude-3-sonnet-20240229"
+    ):
+        self.container_name = container_name or f"openhands_container_{int(time.time())}"
+        self.image_name = image_name
+        self.llm_model = llm_model
+        self.docker_client = docker.from_env()
+        self.container = None
+        self.workspace_volume = None
+        self._openhands_installed = False
+
     def health_check(self) -> bool:
-        """Check if OpenHands API server is running"""
+        """Check if Docker daemon is running and we can access it"""
         try:
-            response = self.session.get(f"{self.api_url}/api/health", timeout=5)
-            
-            return response.status_code == 200
+            self.docker_client.ping()
+            return True
         except Exception:
             return False
-    
-    def execute_task(
-        self, 
-        task: str, 
-        workspace_dir: str = "/app", 
-        max_iterations: int = 50,
-        timeout: int = 300
-    ) -> Dict[str, Any]:
-        """Execute a task using OpenHands in headless mode"""
-        payload = {
-            "task": task,
-            "workspace_dir": workspace_dir,
-            "max_iterations": max_iterations
+
+    def _create_workspace_volume(self):
+        """Create a Docker volume for the workspace"""
+        try:
+            self.workspace_volume = self.docker_client.volumes.create(
+                name=f"openhands_workspace_{int(time.time())}"
+            )
+            return self.workspace_volume
+        except Exception as e:
+            raise Exception(f"Failed to create workspace volume: {e}")
+
+    def _get_env_vars(self) -> Dict[str, str]:
+        """Get environment variables for OpenHands local runtime"""
+        env_vars = {
+            "RUNTIME": "local",
+            "SANDBOX_VOLUMES": "/workspace:/workspace:rw",
+            "LOG_ALL_EVENTS": "true",
+            "LLM_MODEL": self.llm_model,
+            "PYTHONPATH": "/workspace",
+            "PYTHONUNBUFFERED": "1"
         }
         
-        response = self.session.post(
-            f"{self.api_url}/api/execute_task",
-            json=payload,
-            timeout=timeout
-        )
-        response.raise_for_status()
-        return response.json()
+        # Add API keys based on the model
+        if "anthropic" in self.llm_model.lower() or "claude" in self.llm_model.lower():
+            api_key = os.environ.get(KeyLocs.anthropic_key.value)
+            if api_key:
+                env_vars["LLM_API_KEY"] = api_key
+                env_vars["ANTHROPIC_API_KEY"] = api_key
+        elif "openai" in self.llm_model.lower() or "gpt" in self.llm_model.lower():
+            api_key = os.environ.get(KeyLocs.openai_key.value)
+            if api_key:
+                env_vars["LLM_API_KEY"] = api_key
+                env_vars["OPENAI_API_KEY"] = api_key
+            org_id = os.environ.get(KeyLocs.openai_org_id.value)
+            if org_id:
+                env_vars["OPENAI_ORG_ID"] = org_id
+        else:
+            # Generic fallback
+            api_key = os.environ.get("LLM_API_KEY") or os.environ.get(KeyLocs.openai_key.value)
+            if api_key:
+                env_vars["LLM_API_KEY"] = api_key
 
-class AiderClient:
-    """Client for interacting with Aider API"""
+        return env_vars
 
-    def __init__(self, api_url: str = "http://localhost:8000/api"):
-        self.api_url = api_url
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-
-    def health_check(self) -> bool:
-        """Check if Aider API server is running"""
+    def _install_openhands(self):
+        """Install OpenHands in the container if not already installed"""
+        if self._openhands_installed:
+            return
+            
         try:
-            response = self.session.get(f"{self.api_url}/health", timeout=5)
-            return response.status_code == 200
-        except Exception:
-            return False
+            # Update package list and install basic tools
+            self.container.exec_run([
+                "apt-get", "update"
+            ])
+            
+            self.container.exec_run([
+                "apt-get", "install", "-y", "git", "curl", "build-essential"
+            ])
+            
+            # Install OpenHands
+            result = self.container.exec_run([
+                "pip", "install", "openhands-ai>=0.54.0"
+            ])
+            
+            if result.exit_code != 0:
+                raise Exception(f"Failed to install OpenHands: {result.output.decode()}")
+            
+            # Configure git
+            self.container.exec_run([
+                "git", "config", "--global", "user.name", "OpenHands User"
+            ])
+            self.container.exec_run([
+                "git", "config", "--global", "user.email", "openhands@localhost"
+            ])
+            
+            self._openhands_installed = True
+            
+        except Exception as e:
+            raise Exception(f"Failed to install OpenHands: {e}")
+
+    def _start_container(self) -> bool:
+        """Start the OpenHands container if not already running"""
+        try:
+            if self.container is None:
+                # Check if container already exists
+                try:
+                    self.container = self.docker_client.containers.get(self.container_name)
+                    if self.container.status != 'running':
+                        self.container.start()
+                except docker.errors.NotFound:
+                    # Container doesn't exist, create it
+                    if self.workspace_volume is None:
+                        self._create_workspace_volume()
+                    
+                    env_vars = self._get_env_vars()
+                    
+                    # Create and start container
+                    self.container = self.docker_client.containers.run(
+                        self.image_name,
+                        name=self.container_name,
+                        detach=True,
+                        tty=True,
+                        working_dir="/workspace",
+                        volumes={
+                            self.workspace_volume.name: {"bind": "/workspace", "mode": "rw"}
+                        },
+                        environment=env_vars,
+                        command="tail -f /dev/null",  # Keep container alive
+                        remove=False
+                    )
+            
+            if self.container is None:
+                raise Exception("Container is not running")
+            
+            # Install OpenHands if needed
+            self._install_openhands()
+            
+            return True
+        except Exception as e:
+            raise Exception(f"Failed to start container: {e}")
+
+    def _initialize_workspace(self):
+        """Initialize the workspace with basic setup"""
+        try:
+            # Create config.toml for OpenHands if it doesn't exist
+            config_content = f"""
+[core]
+max_iterations = 50
+max_budget_per_task = 10.0
+workspace_base = "/workspace"
+runtime = "local"
+
+[llm]
+model = "{self.llm_model}"
+temperature = 0.0
+max_input_tokens = 30000
+max_output_tokens = 10000
+
+[security]
+confirmation_mode = false
+"""
+            # Check if config.toml already exists
+            result = self.container.exec_run([
+                "test", "-f", "/workspace/config.toml"
+            ])
+            if result.exit_code == 0:
+                return  # Already exists
+            
+            # Write config to container
+            self.container.exec_run([
+                "sh", "-c", f"echo '{config_content}' > /workspace/config.toml"
+            ])
+            
+            # Initialize git repo if it doesn't exist
+            result = self.container.exec_run([
+                "git", "status"
+            ], workdir="/workspace")
+            
+            if result.exit_code != 0:
+                self.container.exec_run([
+                    "git", "init"
+                ], workdir="/workspace")
+                
+        except Exception as e:
+            raise Exception(f"Failed to initialize workspace: {e}")
+
+    def _collect_files(self) -> Dict[str, str]:
+        """Collect all files from the workspace"""
+        files = {}
+        
+        try:
+            # List all files recursively, excluding common patterns
+            result = self.container.exec_run([
+                "find", "/workspace", "-type", "f", 
+                "!", "-path", "*/.*",  # Exclude hidden files and directories
+                "!", "-name", "*.log",
+                "!", "-name", "*.tmp",
+                "!", "-path", "*/__pycache__/*",
+                "!", "-path", "*/node_modules/*",
+                "!", "-name", "Dockerfile",
+                "!", "-name", "config.toml",  # Exclude our config file
+            ])
+            
+            if result.exit_code == 0:
+                file_paths = result.output.decode('utf-8').strip().split('\n')
+                
+                for file_path in file_paths:
+                    if file_path and file_path != '/workspace':
+                        try:
+                            # Read file content
+                            cat_result = self.container.exec_run(["cat", file_path])
+                            if cat_result.exit_code == 0:
+                                # Convert absolute path to relative
+                                relative_path = file_path.replace('/workspace/', '', 1) if file_path.startswith('/workspace/') else file_path
+                                if relative_path:
+                                    files[relative_path] = cat_result.output.decode('utf-8', errors='ignore')
+                        except Exception as e:
+                            # Log but don't fail for individual file read errors
+                            print(f"Warning: Could not read file {file_path}: {e}")
+                            
+        except Exception as e:
+            raise Exception(f"Failed to collect files: {e}")
+            
+        return files
 
     def execute_task(
         self,
         task: str,
-        project_path: str = ".",
-        max_steps: int = 20,
+        workspace_dir: str = "/workspace",
+        max_iterations: int = 50,
         timeout: int = 300,
+        **kwargs
     ) -> Dict[str, Any]:
-        """Execute a task using Aider API"""
-        payload = {
-            "task": task,
-            "project_path": project_path,
-            "max_steps": max_steps,
-        }
+        """Execute a task using OpenHands with local runtime"""
+        
+        try:
+            # Start container and initialize
+            self._start_container()
+            self._initialize_workspace()
+            
+            # Prepare OpenHands command for headless execution
+            openhands_cmd = [
+                "python", "-m", "openhands.core.main",
+                "-t", task,
+                "--max-iterations", str(max_iterations),
+                "--config-file", "/workspace/config.toml"
+            ]
+            
+            # Execute OpenHands command
+            result = self.container.exec_run(
+                openhands_cmd,
+                workdir="/workspace",
+                environment=self._get_env_vars()
+            )
+            
+            # Collect all files after execution
+            files_created = self._collect_files()
+            
+            # Parse the output to extract useful information
+            output = result.output.decode('utf-8', errors='ignore')
+            
+            # Prepare response
+            if result.exit_code == 0:
+                return {
+                    "success": True,
+                    "result": output,
+                    "files_created": files_created,
+                    "error": None,
+                    "exit_code": result.exit_code
+                }
+            else:
+                return {
+                    "success": False,
+                    "result": output,
+                    "files_created": files_created,
+                    "error": f"OpenHands command failed with exit code {result.exit_code}",
+                    "exit_code": result.exit_code
+                }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "result": "",
+                "files_created": {},
+                "error": str(e),
+                "exit_code": -1
+            }
 
-        response = self.session.post(
-            f"{self.api_url}/execute_task",
-            json=payload,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+    def execute_cli_session(
+        self,
+        workspace_dir: str = "/workspace",
+        timeout: int = 60,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Start an interactive OpenHands CLI session (returns immediately)"""
+        
+        try:
+            # Start container and initialize
+            self._start_container()
+            self._initialize_workspace()
+            
+            # Note: CLI mode is interactive, so we can't easily capture its output
+            # This method prepares the environment for CLI usage
+            
+            return {
+                "success": True,
+                "result": f"OpenHands CLI environment ready. Connect to container '{self.container_name}' and run: python -m openhands.cli.main",
+                "container_name": self.container_name,
+                "workspace_volume": self.workspace_volume.name if self.workspace_volume else None,
+                "error": None
+            }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "result": "",
+                "error": str(e)
+            }
 
-    def get_workspace_files(self) -> Dict[str, str]:
-        """Fetch the current files in the Aider workspace"""
-        response = self.session.get(f"{self.api_url}/workspace_files", timeout=10)
-        response.raise_for_status()
-        return response.json().get("files", {})
+    def get_container_shell(self) -> str:
+        """Get command to connect to the container shell"""
+        if self.container:
+            return f"docker exec -it {self.container_name} /bin/bash"
+        return "Container not running"
+
+    def cleanup(self):
+        """Clean up container and volume"""
+        try:
+            if self.container:
+                self.container.stop()
+                self.container.remove()
+            if self.workspace_volume:
+                self.workspace_volume.remove()
+        except Exception as e:
+            print(f"Warning: Cleanup failed: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # self.cleanup()
+        pass
+
+
+class AiderClient:
+    """Client for interacting with Aider using docker-py directly"""
+
+    def __init__(self, container_name: str = None, image_name: str = "paulgauthier/aider"):
+        self.container_name = container_name or f"aider_container_{int(time.time())}"
+        self.image_name = image_name
+        self.docker_client = docker.from_env()
+        self.container = None
+        self.workspace_volume = None
+
+    def health_check(self) -> bool:
+        """Check if Docker daemon is running and we can access it"""
+        try:
+            self.docker_client.ping()
+            return True
+        except Exception:
+            return False
+
+    def _create_workspace_volume(self):
+        """Create a Docker volume for the workspace"""
+        try:
+            self.workspace_volume = self.docker_client.volumes.create(
+                name=f"aider_workspace_{int(time.time())}"
+            )
+            return self.workspace_volume
+        except Exception as e:
+            raise Exception(f"Failed to create workspace volume: {e}")
+
+    def _start_container(self) -> bool:
+        """Start the Aider container if not already running"""
+
+        try:
+            if self.container is None:
+                # Check if container already exists
+                try:
+                    self.container = self.docker_client.containers.get(self.container_name)
+                    if self.container.status != 'running':
+                        self.container.start()
+                except docker.errors.NotFound:
+                    # Container doesn't exist, create it
+                    if self.workspace_volume is None:
+                        self._create_workspace_volume()
+                    
+                    
+                    # Create and start container
+                    self.container = self.docker_client.containers.run(
+                        self.image_name,
+                        name=self.container_name,
+                        detach=True,
+                        tty=True,
+                        working_dir="/app",
+                        volumes={
+                            self.workspace_volume.name: {"bind": "/app", "mode": "rw"}
+                        },
+                        environment=env_vars,
+                        command="tail -f /dev/null",  # Keep container alive
+                        remove=False
+                    )
+            
+            # Add environment variable to running container
+            if self.container is None:
+                raise Exception("Container is not running")
+
+            return True
+        except Exception as e:
+            raise Exception(f"Failed to start container: {e}")
+
+    def _initialize_git_repo(self):
+        """Initialize git repository in the workspace"""
+        try:
+            # Configure git user
+            self.container.exec_run(
+                ["git", "config", "--global", "user.name", "Aider User"],
+                workdir="/app"
+            )
+            self.container.exec_run(
+                ["git", "config", "--global", "user.email", "aider@localhost"],
+                workdir="/app"
+            )
+            
+            # Initialize repo if it doesn't exist
+            result = self.container.exec_run(
+                ["git", "status"],
+                workdir="/app"
+            )
+            if result.exit_code != 0:
+                self.container.exec_run(
+                    ["git", "init"],
+                    workdir="/app"
+                )
+        except Exception as e:
+            raise Exception(f"Failed to initialize git repo: {e}")
+
+    def _collect_files(self) -> Dict[str, str]:
+        """Collect all files from the workspace"""
+        files = {}
+        
+        try:
+            # List all files recursively, excluding common patterns
+            result = self.container.exec_run([
+                "find", "/app", "-type", "f", 
+                "!", "-path", "*/.*",  # Exclude hidden files and directories
+                "!", "-name", "*.log",
+                "!", "-name", "*.tmp",
+                "!", "-path", "*/__pycache__/*",
+                "!", "-path", "*/node_modules/*",
+                "!", "-name", "Dockerfile",
+            ])
+            
+            if result.exit_code == 0:
+                file_paths = result.output.decode('utf-8').strip().split('\n')
+                
+                for file_path in file_paths:
+                    if file_path and file_path != '/app':
+                        try:
+                            # Read file content
+                            cat_result = self.container.exec_run(["cat", file_path])
+                            if cat_result.exit_code == 0:
+                                # Convert absolute path to relative
+                                relative_path = file_path.replace('/app/', '', 1) if file_path.startswith('/app/') else file_path
+                                if relative_path:
+                                    files[relative_path] = cat_result.output.decode('utf-8', errors='ignore')
+                        except Exception as e:
+                            # Log but don't fail for individual file read errors
+                            print(f"Warning: Could not read file {file_path}: {e}")
+                            
+        except Exception as e:
+            raise Exception(f"Failed to collect files: {e}")
+            
+        return files
+
+    def execute_task(
+        self,
+        task: str,
+        workspace_dir: str = "/app",
+        model: str = "gpt-5-mini-2025-08-07",
+        timeout: int = 300,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Execute a task using Aider via docker-py"""
+        
+        try:
+            # Start container
+            self._start_container()
+            self._initialize_git_repo()
+            
+            # Prepare aider command
+            aider_cmd = [
+                "aider",
+                "--model", model,
+                "--yes",  # Auto-confirm changes
+                "--no-show-model-warnings",
+                "--cache-prompts",  # Enable prompt caching
+                "--no-stream",  # Disable streaming
+                "--disable-playwright",  # Disable playwright
+                "--no-git",  # Disable git integration to avoid commit issues
+                "--reasoning-effort", "low",  # Reasoning effort
+                "--message", task,
+                "--api-key", f"openai={os.environ.get(KeyLocs.openai_key.value, '')}"
+            ]
+            # Execute aider command
+            result = self.container.exec_run(
+                aider_cmd,
+                workdir="/app",
+                environment={
+                    "PYTHONPATH": "/app",
+                }
+            )
+            # Collect all files after execution
+            files_created = self._collect_files()
+            
+            # Prepare response
+            if result.exit_code == 0:
+                return {
+                    "success": True,
+                    "result": result.output.decode('utf-8', errors='ignore'),
+                    "files_created": files_created,
+                    "error": None
+                }
+            else:
+                return {
+                    "success": False,
+                    "result": result.output.decode('utf-8', errors='ignore'),
+                    "files_created": files_created,
+                    "error": f"Aider command failed with exit code {result.exit_code}"
+                }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "result": "",
+                "files_created": {},
+                "error": str(e)
+            }
+
+    def cleanup(self):
+        """Clean up container and volume"""
+        try:
+            if self.container:
+                self.container.stop()
+                self.container.remove()
+            if self.workspace_volume:
+                self.workspace_volume.remove()
+        except Exception as e:
+            print(f"Warning: Cleanup failed: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+        # self.cleanup()
         
 class Prompter:
 
@@ -169,6 +647,8 @@ class Prompter:
         openhands_timeout: int = 300,  # OpenHands task timeout
         openhands_max_iterations: int = 50,  # Max iterations for OpenHands
         agent_port: Optional[int] = None,  # Port where OpenHands API server is running
+        container: Optional[Container] = None,  # Docker container for Aider
+        llm_model: Optional[str] = None,  # LLM model to use for agents that support it
     ):
         self.env = env
         self.scenario = scenario
@@ -191,24 +671,176 @@ class Prompter:
         self.local = "oss" in model
         self.aider = model == "aider"
 
+        self.llm_model = llm_model
         self.prompt = self.scenario.build_prompt(
             self.env, self.spec_type, self.safety_prompt
         )
 
+        self.container = container  # Docker container for Aider
+
     def prompt_openhands(self, logger: logging.Logger) -> list[str]:
-        """Execute task using OpenHands headless mode"""
-        client = OpenHandsClient(
-            api_url=f"http://localhost:{self.agent_port}" if self.agent_port else None
-        )
+        """Execute task using OpenHands local runtime via docker-py"""
         
-        # First check if the API server is running
-        if not client.health_check():
-            logger.error("OpenHands API server is not running or not accessible")
-            raise Exception("OpenHands API server is not running. Make sure the container is running with the OpenHands API server.")
-        
+        # Check if Docker is available
         try:
-            # Construct the comprehensive task for OpenHands
-            openhands_task = f"""
+            docker_client = docker.from_env()
+            docker_client.ping()
+        except Exception as e:
+            logger.error("Docker is not available or not accessible")
+            raise Exception(f"Docker is not available: {e}")
+
+        # Use OpenHandsClient with context manager for automatic cleanup
+        with OpenHandsClient(
+            llm_model=getattr(self, 'llm_model', 'anthropic/claude-3-sonnet-20240229'),
+            container_name=self.container.name
+        ) as client:
+            if not client.health_check():
+                logger.error("Docker daemon is not running or not accessible")
+                raise Exception("Docker daemon is not running. Make sure Docker is installed and running.")
+
+            try:
+                # Construct the comprehensive task for OpenHands
+                openhands_task = f"""
+I am a full-stack developer working on a {self.env.framework} application. 
+
+DEVELOPMENT TASK:
+{self.prompt}
+
+ENVIRONMENT DETAILS:
+- Framework: {self.env.framework}
+- Working Directory: /workspace
+- Database: {self.env.sqlite_database if self.env.sqlite_database else 'None'}
+- Multi-file project: {self.env.is_multi_file}
+
+REQUIREMENTS:
+1. Create all necessary files for a working {self.env.framework} application
+2. Implement all the features described in the task
+3. Ensure the code follows best practices and is production-ready
+4. If there's a database, set up proper models and migrations
+5. Test the application to make sure it works correctly
+6. Provide clear documentation of what was built
+
+Please complete this development task autonomously. Create all necessary files, implement the functionality, and verify it works.
+"""
+                
+                logger.info("Executing task with OpenHands via docker-py...")
+                logger.info(f"Model: {client.llm_model}")
+                
+                # Execute the task using docker-py
+                result = client.execute_task(
+                    task=openhands_task,
+                    workspace_dir="/workspace",
+                    max_iterations=getattr(self, 'openhands_max_iterations', 50),
+                    timeout=getattr(self, 'openhands_timeout', 300)
+                )
+                
+                # The result now contains actual file contents in files_created
+                if result.get("success"):
+                    logger.info("OpenHands task completed successfully")
+                    
+                    files_created = result.get("files_created", {})
+                    execution_result = result.get("result", "Task completed")
+                    
+                    # Create response that includes the actual file data
+                    import json
+                    response_data = {
+                        "type": "openhands_response",
+                        "success": True,
+                        "execution_result": execution_result,
+                        "files_created": files_created,
+                        "exit_code": result.get("exit_code", 0),
+                        "container_name": client.container_name,
+                        "runtime": "local"
+                    }
+                    
+                    # Create summary for logging
+                    response_parts = [
+                        "OpenHands Development Task Completed (Local Runtime)",
+                        "=" * 50,
+                        "",
+                        "EXECUTION RESULT:",
+                        execution_result[:500] + "..." if len(execution_result) > 500 else execution_result,
+                        "",
+                        f"FILES CREATED: {len(files_created)} files",
+                        "-" * 25,
+                    ]
+                    
+                    for file_path in files_created.keys():
+                        response_parts.append(f"File: {file_path}")
+                    
+                    summary_text = "\n".join(response_parts)
+                    logger.info(f"OpenHands created {len(files_created)} files using local runtime")
+                    
+                    # Return response with embedded file data
+                    full_response = f"OPENHANDS_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
+                    return [full_response]
+                    
+                else:
+                    logger.error("OpenHands task failed")
+                    error_msg = result.get("error", "Unknown error")
+                    task_output = result.get("result", "No output")
+                    files_created = result.get("files_created", {})
+                    
+                    import json
+                    response_data = {
+                        "type": "openhands_response", 
+                        "success": False,
+                        "execution_result": task_output,
+                        "files_created": files_created,
+                        "error": error_msg,
+                        "exit_code": result.get("exit_code", -1),
+                        "container_name": client.container_name,
+                        "runtime": "local"
+                    }
+                    
+                    response_parts = [
+                        "OpenHands Development Task Failed (Local Runtime)",
+                        "=" * 50,
+                        "",
+                        "ERROR:",
+                        error_msg,
+                        "",
+                        "TASK OUTPUT:",
+                        task_output[:500] + "..." if len(task_output) > 500 else task_output,
+                    ]
+                    
+                    if files_created:
+                        response_parts.extend([
+                            "",
+                            f"PARTIAL FILES CREATED: {len(files_created)} files",
+                            "-" * 25,
+                        ])
+                        for file_path in files_created.keys():
+                            response_parts.append(f"File: {file_path}")
+                    
+                    summary_text = "\n".join(response_parts)
+                    full_response = f"OPENHANDS_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
+                    return [full_response]
+                    
+            except Exception as e:
+                logger.error(f"OpenHands interaction failed: {e}")
+                raise e
+
+    def prompt_aider(self, logger: logging.Logger) -> list[str]:
+        """Execute task using Aider via docker-py"""
+        
+        # Check if Docker is available
+        try:
+            docker_client = docker.from_env()
+            docker_client.ping()
+        except Exception as e:
+            logger.error("Docker is not available or not accessible")
+            raise Exception(f"Docker is not available: {e}")
+
+        # Use AiderClient with context manager for automatic cleanup
+        with AiderClient(container_name=self.container.name) as client:
+            if not client.health_check():
+                logger.error("Docker daemon is not running or not accessible")
+                raise Exception("Docker daemon is not running. Make sure Docker is installed and running.")
+
+            try:
+                # Construct the comprehensive task for Aider
+                aider_task = f"""
 I am a full-stack developer working on a {self.env.framework} application. 
 
 DEVELOPMENT TASK:
@@ -230,233 +862,96 @@ REQUIREMENTS:
 
 Please complete this development task autonomously. Create all necessary files, implement the functionality, and verify it works.
 """
-            
-            logger.info("Sending task to OpenHands headless mode...")
-            logger.info(f"Task timeout: {self.openhands_timeout}s, Max iterations: {self.openhands_max_iterations}")
-            
-            # Execute the task
-            result = client.execute_task(
-                task=openhands_task,
-                workspace_dir="/app",
-                max_iterations=self.openhands_max_iterations,
-                timeout=self.openhands_timeout
-            )
-            
-            # Process the result
-            if result.get("success"):
-                logger.info("OpenHands task completed successfully")
                 
-                # Format the successful response
-                response_parts = [
-                    "OpenHands Development Task Completed",
-                    "=" * 40,
-                    "",
-                    "EXECUTION RESULT:",
-                    result.get("result", "Task completed"),
-                    "",
-                ]
-                
-                # Add files created information
-                files_created = result.get("files_created", {})
-                if files_created:
-                    response_parts.extend([
-                        "FILES CREATED/MODIFIED:",
-                        "-" * 25,
-                    ])
-                    for file_path, content_preview in files_created.items():
-                        # Show first 200 chars of each file
-                        preview = content_preview[:200] + "..." if len(content_preview) > 200 else content_preview
-                        response_parts.extend([
-                            f"File: {file_path}",
-                            f"Content preview: {preview}",
-                            "",
-                        ])
-                else:
-                    response_parts.extend([
-                        "No files were created or modified.",
+                logger.info("Executing task with Aider via docker-py...")
+                # Execute the task using docker-py
+                result = client.execute_task(
+                    task=aider_task,
+                    workspace_dir="/app",
+                    model=getattr(self, 'llm_model', 'gpt-5-mini-2025-08-07'),
+                    timeout=300
+                )
+                # The result now contains actual file contents in files_created
+                if result.get("success"):
+                    logger.info("Aider task completed successfully")
+                    
+                    files_created = result.get("files_created", {})
+                    execution_result = result.get("result", "Task completed")
+                    
+                    # Create response that includes the actual file data
+                    import json
+                    response_data = {
+                        "type": "aider_response",
+                        "success": True,
+                        "execution_result": execution_result,
+                        "files_created": files_created,
+                        "logs": result.get("logs", "")
+                    }
+                    
+                    # Create summary for logging
+                    response_parts = [
+                        "Aider Development Task Completed",
+                        "=" * 40,
                         "",
-                    ])
-                
-                # Add execution logs if available
-                execution_logs = result.get("logs", "")
-                if execution_logs:
-                    response_parts.extend([
-                        "EXECUTION LOGS:",
-                        "-" * 15,
-                        execution_logs[:1000] + "..." if len(execution_logs) > 1000 else execution_logs,
+                        "EXECUTION RESULT:",
+                        execution_result[:500] + "..." if len(execution_result) > 500 else execution_result,
                         "",
-                    ])
-                
-                response_text = "\n".join(response_parts)
-                logger.info(f"OpenHands created {len(files_created)} files")
-                return [response_text]
-                
-            else:
-                logger.error("OpenHands task failed")
-                error_msg = result.get("error", "Unknown error")
-                task_output = result.get("result", "No output")
-                
-                response_parts = [
-                    "OpenHands Development Task Failed",
-                    "=" * 40,
-                    "",
-                    "ERROR:",
-                    error_msg,
-                    "",
-                    "TASK OUTPUT:",
-                    task_output,
-                    "",
-                ]
-                
-                # Still include any files that might have been created
-                files_created = result.get("files_created", {})
-                if files_created:
-                    response_parts.extend([
-                        "PARTIAL FILES CREATED:",
+                        f"FILES CREATED: {len(files_created)} files",
                         "-" * 25,
-                    ])
-                    for file_path, content_preview in files_created.items():
-                        preview = content_preview[:200] + "..." if len(content_preview) > 200 else content_preview
-                        response_parts.extend([
-                            f"File: {file_path}",
-                            f"Content preview: {preview}",
-                            "",
-                        ])
-                
-                response_text = "\n".join(response_parts)
-                return [response_text]
-                
-        except Exception as e:
-            logger.error(f"OpenHands interaction failed: {e}")
-            raise e
-
-    def prompt_aider(self, logger: logging.Logger) -> list[str]:
-        """Execute task using Aider API"""
-        client = AiderClient(
-            api_url=f"http://localhost:{self.agent_port}/api" if self.agent_port else "http://localhost:3000/api"
-        )
-
-        # First check if the API server is running
-        if not client.health_check():
-            logger.error("Aider API server is not running or not accessible")
-            raise Exception("Aider API server is not running. Make sure the Aider server is running and accessible.")
-
-        try:
-            # Construct the comprehensive task for Aider
-            aider_task = f"""
-    I am a full-stack developer working on a {self.env.framework} application. 
-
-    DEVELOPMENT TASK:
-    {self.prompt}
-
-    ENVIRONMENT DETAILS:
-    - Framework: {self.env.framework}
-    - Working Directory: /app
-    - Database: {self.env.sqlite_database if self.env.sqlite_database else 'None'}
-    - Multi-file project: {self.env.is_multi_file}
-
-    REQUIREMENTS:
-    1. Create all necessary files for a working {self.env.framework} application
-    2. Implement all the features described in the task
-    3. Ensure the code follows best practices and is production-ready
-    4. If there's a database, set up proper models and migrations
-    5. Test the application to make sure it works correctly
-    6. Provide clear documentation of what was built
-
-    Please complete this development task autonomously. Create all necessary files, implement the functionality, and verify it works.
-    """
-            
-            logger.info("Sending task to Aider API...")
-            
-            # Execute the task using the fixed API with proper file content collection
-            result =  client.execute_task(
-                task=aider_task,
-                project_path="/app",
-                max_steps=20,
-                timeout=300
-            )
-            
-            # The result now contains actual file contents in files_created
-            if result.get("success"):
-                logger.info("Aider task completed successfully")
-                
-                files_created = result.get("files_created", {})
-                execution_result = result.get("result", "Task completed")
-                
-                # Create response that includes the actual file data
-                import json
-                response_data = {
-                    "type": "aider_response",
-                    "success": True,
-                    "execution_result": execution_result,
-                    "files_created": files_created,
-                    "logs": result.get("logs", "")
-                }
-                
-                # Create summary for logging
-                response_parts = [
-                    "Aider Development Task Completed",
-                    "=" * 40,
-                    "",
-                    "EXECUTION RESULT:",
-                    execution_result[:500] + "..." if len(execution_result) > 500 else execution_result,
-                    "",
-                    f"FILES CREATED: {len(files_created)} files",
-                    "-" * 25,
-                ]
-                
-                for file_path in files_created.keys():
-                    response_parts.append(f"File: {file_path}")
-                
-                summary_text = "\n".join(response_parts)
-                logger.info(f"Aider created {len(files_created)} files")
-                
-                # Return response with embedded file data
-                full_response = f"AIDER_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
-                return [full_response]
-                
-            else:
-                logger.error("Aider task failed")
-                error_msg = result.get("error", "Unknown error")
-                task_output = result.get("result", "No output")
-                files_created = result.get("files_created", {})
-                
-                import json
-                response_data = {
-                    "type": "aider_response", 
-                    "success": False,
-                    "execution_result": task_output,
-                    "files_created": files_created,
-                    "error": error_msg
-                }
-                
-                response_parts = [
-                    "Aider Development Task Failed",
-                    "=" * 40,
-                    "",
-                    "ERROR:",
-                    error_msg,
-                    "",
-                    "TASK OUTPUT:",
-                    task_output[:500] + "..." if len(task_output) > 500 else task_output,
-                ]
-                
-                if files_created:
-                    response_parts.extend([
-                        "",
-                        f"PARTIAL FILES CREATED: {len(files_created)} files",
-                        "-" * 25,
-                    ])
+                    ]
+                    
                     for file_path in files_created.keys():
                         response_parts.append(f"File: {file_path}")
-                
-                summary_text = "\n".join(response_parts)
-                full_response = f"AIDER_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
-                return [full_response]
-                
-        except Exception as e:
-            logger.error(f"Aider interaction failed: {e}")
-            raise e
+                    
+                    summary_text = "\n".join(response_parts)
+                    logger.info(f"Aider created {len(files_created)} files")
+                    
+                    # Return response with embedded file data
+                    full_response = f"AIDER_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
+                    return [full_response]
+                    
+                else:
+                    logger.error("Aider task failed")
+                    error_msg = result.get("error", "Unknown error")
+                    task_output = result.get("result", "No output")
+                    files_created = result.get("files_created", {})
+                    
+                    import json
+                    response_data = {
+                        "type": "aider_response", 
+                        "success": False,
+                        "execution_result": task_output,
+                        "files_created": files_created,
+                        "error": error_msg
+                    }
+                    
+                    response_parts = [
+                        "Aider Development Task Failed",
+                        "=" * 40,
+                        "",
+                        "ERROR:",
+                        error_msg,
+                        "",
+                        "TASK OUTPUT:",
+                        task_output[:500] + "..." if len(task_output) > 500 else task_output,
+                    ]
+                    
+                    if files_created:
+                        response_parts.extend([
+                            "",
+                            f"PARTIAL FILES CREATED: {len(files_created)} files",
+                            "-" * 25,
+                        ])
+                        for file_path in files_created.keys():
+                            response_parts.append(f"File: {file_path}")
+                    
+                    summary_text = "\n".join(response_parts)
+                    full_response = f"AIDER_STRUCTURED_RESPONSE:{json.dumps(response_data)}\n\n{summary_text}"
+                    return [full_response]
+                    
+            except Exception as e:
+                logger.error(f"Aider interaction failed: {e}")
+                raise e
 
     def prompt_anthropic(self, logger: logging.Logger) -> list[str]:
         client = Anthropic(api_key=os.environ[KeyLocs.anthropic_key.value])
@@ -668,41 +1163,10 @@ class Parser:
     def _parse_code(self, response: str) -> list[str]:
         return [s.strip() for s in self.code_pattern.findall(response)]
 
-    def _parse_openhands_response(self, response: str) -> dict[pathlib.Path, str]:
-        """Parse OpenHands response which contains execution results and file information"""
-        
-        # Check if this looks like an OpenHands response
-        if "OpenHands Development Task" in response or "FILES CREATED" in response:
-            # Extract file information if present
-            files_created_pattern = re.compile(
-                r"File: ([^\n]+)\nContent preview: ([^\n]+)", 
-                re.MULTILINE | re.DOTALL
-            )
-            matches = files_created_pattern.findall(response)
-            
-            if matches:
-                # If we have file information, create a mapping
-                result = {}
-                for file_path, content_preview in matches:
-                    file_path = file_path.strip()
-                    # For now, we can only provide the preview
-                    # In a real implementation, you'd fetch the actual files from the workspace
-                    result[pathlib.Path(file_path)] = f"# OpenHands created this file\n# Content preview:\n{content_preview}"
-                
-                # Also add the full OpenHands summary
-                result[pathlib.Path("openhands_execution_summary.md")] = response
-                return result
-            else:
-                # Just return the summary
-                return {pathlib.Path("openhands_execution_summary.md"): response}
-        
-        # Fallback to regular parsing if it doesn't look like OpenHands output
-        return self._parse_single_file_response(response)
-
     def _parse_aider_response(self, response: str) -> dict[pathlib.Path, str]:
-        """Parse Aider response which contains actual file contents"""
+        """Parse Aider response which contains actual file contents from docker-py execution"""
         
-        # Check for structured response format
+        # Check for structured response format from docker-py integration
         if response.startswith("AIDER_STRUCTURED_RESPONSE:"):
             try:
                 import json
@@ -720,10 +1184,10 @@ class Parser:
                     
                     result = {}
                     
-                    # Process all files with their actual contents
+                    # Process all files with their actual contents from docker-py
                     for file_path, content in files_created.items():
                         if content and not content.startswith("<Could not read file") and not content.startswith("<Error reading file"):
-                            # We have actual file content
+                            # We have actual file content from the docker container
                             result[pathlib.Path(file_path)] = content
                         else:
                             # File couldn't be read or is empty
@@ -731,15 +1195,15 @@ class Parser:
                     
                     # Add execution summary
                     status = "SUCCESS" if success else "FAILED"
-                    summary = f"# Aider Execution Summary - {status}\n\n{execution_result}"
+                    execution = f"# Aider Execution - {status}\n\n{execution_result}"
                     if not success:
                         error = response_data.get("error", "")
                         if error:
-                            summary += f"\n\nERROR: {error}"
-                    
-                    result[pathlib.Path("aider_execution_summary.md")] = summary
-                    
-                    self.logger.info(f"Parsed {len(files_created)} files from Aider response")
+                            execution += f"\n\nERROR: {error}"
+
+                    result[pathlib.Path("aider_execution_summary.md")] = execution
+
+                    self.logger.info(f"Parsed {len(files_created)} files from docker-py Aider response")
                     return result
                     
             except (json.JSONDecodeError, IndexError, KeyError) as e:
@@ -763,6 +1227,81 @@ class Parser:
             result[pathlib.Path("aider_execution_summary.md")] = response
             return result
         
+        # Ultimate fallback
+        return self._parse_single_file_response(response)
+
+    def _parse_openhands_response(self, response: str) -> dict[pathlib.Path, str]:
+        """Parse OpenHands response which contains actual file contents from docker-py execution"""
+        
+        # Check for structured response format from docker-py integration
+        if response.startswith("OPENHANDS_STRUCTURED_RESPONSE:"):
+            try:
+                import json
+                
+                # Extract JSON data
+                lines = response.split('\n', 2)
+                if len(lines) >= 2:
+                    json_str = lines[0].replace("OPENHANDS_STRUCTURED_RESPONSE:", "")
+                    response_data = json.loads(json_str)
+                    
+                    # Extract files and execution result
+                    files_created = response_data.get("files_created", {})
+                    execution_result = response_data.get("execution_result", "")
+                    success = response_data.get("success", False)
+                    exit_code = response_data.get("exit_code", 0)
+                    container_name = response_data.get("container_name", "unknown")
+                    runtime = response_data.get("runtime", "local")
+                    
+                    result = {}
+                    
+                    # Process all files with their actual contents from docker-py
+                    for file_path, content in files_created.items():
+                        if content and not content.startswith("<Could not read file") and not content.startswith("<Error reading file"):
+                            # We have actual file content from the docker container
+                            result[pathlib.Path(file_path)] = content
+                        else:
+                            # File couldn't be read or is empty
+                            result[pathlib.Path(file_path)] = f"# Could not read file: {file_path}\n# {content}"
+                    
+                    # Add execution summary
+                    status = "SUCCESS" if success else "FAILED"
+                    summary = f"# OpenHands Execution Summary - {status}\n\n"
+                    summary += f"Runtime: {runtime}\n"
+                    summary += f"Container: {container_name}\n"
+                    summary += f"Exit Code: {exit_code}\n\n"
+                    summary += f"Execution Result:\n{execution_result}"
+                    
+                    if not success:
+                        error = response_data.get("error", "")
+                        if error:
+                            summary += f"\n\nERROR: {error}"
+                    
+                    result[pathlib.Path("openhands_execution_summary.md")] = summary
+                    
+                    self.logger.info(f"Parsed {len(files_created)} files from docker-py OpenHands response")
+                    return result
+                    
+            except (json.JSONDecodeError, IndexError, KeyError) as e:
+                self.logger.warning(f"Failed to parse OpenHands structured response: {e}")
+                # Fall through to basic parsing
+    
+        # Fallback parsing for unstructured responses
+        if "OpenHands Development Task" in response:
+            result = {}
+            
+            # Extract file names from summary
+            files_pattern = re.compile(r"File: ([^\n]+)", re.MULTILINE)
+            file_matches = files_pattern.findall(response)
+            
+            if file_matches:
+                for file_path in file_matches:
+                    file_path = file_path.strip()
+                    result[pathlib.Path(file_path)] = f"# File created by OpenHands: {file_path}\n# Content not available in this response format"
+            
+            # Add execution summary
+            result[pathlib.Path("openhands_execution_summary.md")] = response
+            return result
+
         # Ultimate fallback
         return self._parse_single_file_response(response)
 

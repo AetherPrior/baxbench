@@ -259,6 +259,7 @@ class Scenario:
                 framework=env.framework,
                 api_spec=self.api_spec,
                 scenario_instructions=self.scenario_instructions,
+                format_instruction=_AGENT_FORMAT_INSTRUCTION,
                 db_instructions=DB_INSTRUCTIONS if self.needs_db else "",
                 secret_instructions=SECRET_INSTRUCTIONS if self.needs_secret else "",
                 allowed_packages=allowed_packages,

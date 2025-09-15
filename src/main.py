@@ -5,24 +5,28 @@ import docker
 
 from env import all_envs
 from env.aider_envs import all_aider_envs
+from env.openhands_envs import all_openhands_envs
 from env.base import Env
 from print import tasks_and_results_to_table, tasks_and_results_to_table_averages
 from scenarios import all_scenarios
 from scenarios.base import Scenario
 from tasks import Task, TaskHandler
 
-def select_agent_envs(args: argparse.Namespace) -> list[Env]:
-    envs = all_aider_envs
+def select_agent_envs(args: argparse.Namespace, agent_name: str) -> list[Env]:
+    agent2dict = {
+        "aider": all_aider_envs,
+        "openhands": all_openhands_envs,
+    }
     args_envs = args.envs if args.envs else []
     if args_envs:
-        envs = [e for e in all_aider_envs if e.id in args_envs]
-    return envs
+        envs = [e for e in agent2dict[agent_name] if e.id in args_envs]
     envs = sorted(envs, key=lambda e: e.id)
     if not envs:
         raise Exception(
-            f"Got an empty/invalid list of agent envs, possible choices: {[e.id for e in all_aider_envs]}",
+            f"Got an empty/invalid list of agent envs, possible choices: {[e.id for e in agent2dict[agent_name]]}",
         )
     return envs
+
 
 def select_envs(args: argparse.Namespace, is_agent_test: bool = False) -> list[Env]:
     envs = all_envs
@@ -58,7 +62,10 @@ def main(args: argparse.Namespace) -> None:
 
     if args.mode == "generate":
         # ----- Preparation -----#
-        envs = select_agent_envs(args)
+        if "openhands" in args.models[0].lower() or "aider" in args.models[0].lower():
+            envs = select_agent_envs(args, agent_name=args.models[0])
+        else:
+            envs = select_envs(args)
         scenarios = select_scenarios(args)
 
         if args.only_samples:
@@ -77,6 +84,7 @@ def main(args: argparse.Namespace) -> None:
                     safety_prompt=args.safety_prompt,
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
+                    llm_model=getattr(args, 'llm_model', None),
                 )
                 for env in envs
                 for scenario in scenarios
@@ -123,6 +131,7 @@ def main(args: argparse.Namespace) -> None:
                     safety_prompt=args.safety_prompt,
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
+                    llm_model=getattr(args, 'llm_model', None),
                 )
                 for env in envs
                 for scenario in scenarios
@@ -165,6 +174,7 @@ def main(args: argparse.Namespace) -> None:
                     safety_prompt=args.safety_prompt,
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
+                    llm_model=args.llm_model,
                 )
                 for env in envs
                 for scenario in scenarios
@@ -318,5 +328,11 @@ if __name__ == "__main__":
         "--openrouter",
         action="store_true",
         help="Route requests through OpenRouter",
+    )
+    parser.add_argument(
+        "--llm_model",
+        type=str,
+        default=None,
+        help="LLM model to use for agents that support it (e.g., 'gpt-4o', 'gpt-5-mini-2025-08-07')",
     )
     main(parser.parse_args())

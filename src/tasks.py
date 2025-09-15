@@ -111,6 +111,7 @@ class Task:
     spec_type: str
     safety_prompt: str
     openrouter: bool
+    llm_model: Optional[str]
 
     @property
     def id(self) -> str:
@@ -314,7 +315,8 @@ class Task:
         force: bool,
         openrouter: bool,
     ) -> None:
-        # check if this task has already been generated
+        """Generate code using OpenHands local runtime via docker-py"""
+        # Check if this task has already been generated
         if (
             all(
                 [
@@ -342,17 +344,19 @@ class Task:
         gen_logfile_path = save_dir / "gen.log"
         with open(gen_logfile_path, "w") as f:
             f.write("")
+        
         with self.create_logger(gen_logfile_path) as logger:
             logger.info(
-                "generating %s code samples at temp %s for task %s with reasoning effort %s (OpenHands)",
+                "generating %s code samples at temp %s for task %s with reasoning effort %s (OpenHands Local Runtime)",
                 batch_size,
                 self.temperature,
                 self.id,
                 self.reasoning_effort,
             )
 
-            # Build docker image for the environment
+            # Build docker image for the environment (using OpenHands local environments)
             files = {}
+            logger.info("Building docker image for OpenHands local runtime environment...")
             image_id = self.env.build_docker_image(
                 files,
                 self.scenario.needed_packages.get("_all_", [])
@@ -360,19 +364,14 @@ class Task:
                 logger,
                 no_cache=False,
             )
-
-            # Start the container and interact with OpenHands inside it
+            logger.info("Done building docker image. Image ID: %s", image_id)
+            
+            # Use OpenHands with local runtime (no ContainerRunner needed)
+            # OpenHands creates its own containers via docker-py
             with multiprocessing.Manager() as manager:
                 port_manager = SlotManager(manager, 2, min=9000)
                 with ContainerRunner(self.env, port_manager, image_id, logger) as cr:
-                    # Point OpenHandsClient to the API running inside the container
-                    openhands_api_url = f"http://localhost:{cr.agent_port}"
-                    client = OpenHandsClient(api_url=openhands_api_url)
-
-                    if not client.health_check():
-                        logger.error("OpenHands API server is not running or not accessible in the container")
-                        raise Exception("OpenHands API server is not running. Make sure the container is running with the OpenHands API server.")
-
+                    # Create prompter with OpenHands local runtime configuration
                     prompter = Prompter(
                         env=self.env,
                         scenario=self.scenario,
@@ -383,7 +382,9 @@ class Task:
                         temperature=self.temperature,
                         reasoning_effort=self.reasoning_effort,
                         openrouter=openrouter,
-                        agent_port=cr.agent_port,
+                        agent_port=None,  # No agent port needed for local runtime
+                        container=cr.container,  # Pass container for any needed coordination
+                        llm_model=getattr(self, 'llm_model', 'anthropic/claude-3-sonnet-20240229')
                     )
                     logger.info("built OpenHands prompt:\n%s", prompter.prompt)
                     logger.info("-" * 100)
@@ -393,7 +394,7 @@ class Task:
                         retries = 0
                         while True:
                             try:
-                                logger.info(f"OpenHands: generating sample {i+1}/{batch_size}")
+                                logger.info(f"OpenHands: generating sample {i+1}/{batch_size} (local runtime)")
                                 responses = prompter.prompt_openhands(logger)
                                 completions.extend(responses)
                                 break
@@ -482,8 +483,8 @@ class Task:
             logger.info("Building docker image for Aider environment...")
             image_id = self.env.build_docker_image(
                 files,
-                self.scenario.needed_packages.get("_all_", [])
-                + self.scenario.needed_packages.get(self.env.language, []),
+                # self.scenario.needed_packages.get("_all_", []) # compatibility issue with Aider's linux image
+                self.scenario.needed_packages.get(self.env.language, []),
                 logger,
                 no_cache=False,
             )
@@ -511,6 +512,8 @@ class Task:
                         reasoning_effort=self.reasoning_effort,
                         openrouter=openrouter,
                         agent_port=cr.agent_port,
+                        container=cr.container,
+                        llm_model=getattr(self, 'llm_model', None)
                     )
                     logger.info("built Aider prompt:\n%s", prompter.prompt)
                     logger.info("-" * 100)
