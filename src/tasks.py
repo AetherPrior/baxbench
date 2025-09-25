@@ -17,7 +17,7 @@ import tqdm
 from docker.models.containers import Container
 
 import cwes as cwe
-from env.base import COMMON_DOCKER_RUN_COMMANDS, Env
+from env.base import COMMON_DOCKER_RUN_COMMANDS, Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
 from prompts import Parser, Prompter, OpenHandsClient, AiderClient
 import random
 from scenarios.base import AppInstance, FunctionalTest, Scenario, SecurityTest
@@ -25,7 +25,6 @@ from scenarios.base import AppInstance, FunctionalTest, Scenario, SecurityTest
 
 def esc(s: str) -> str:
     return s.replace("/", "-")
-
 
 def run_test_with_timeout(
     f: SecurityTest | FunctionalTest, app_instance: AppInstance, timeout: int
@@ -108,6 +107,7 @@ class Task:
     model: str
     temperature: float
     reasoning_effort: str
+    max_thinking_tokens: int
     spec_type: str
     safety_prompt: str
     openrouter: bool
@@ -135,9 +135,14 @@ class Task:
             logfile_handler.close()
 
     def get_save_dir(self, results_dir: pathlib.Path) -> pathlib.Path:
+        model_reasoning = esc(self.model) 
+        if self.reasoning_effort and self.model.lower() in REASONING_EFFORT_MODELS:
+            model_reasoning += f"_{esc(self.reasoning_effort)}"
+        elif self.model.lower() in REASONING_TOKENS_MODELS and self.max_thinking_tokens: # TODO CHANGE
+            model_reasoning += f"_{esc(self.max_thinking_tokens)}"
         save_dir = (
             results_dir
-            / esc(self.model)
+            / model_reasoning
             / esc(self.scenario.id)
             / esc(self.env.id)
             / f"temp{float(self.temperature)}-{esc(self.spec_type)}-{esc(self.safety_prompt)}"
@@ -238,7 +243,20 @@ class Task:
             )
             and not force
         ):
-            return
+            save_dir = self.get_save_dir(results_dir)
+            gen_logfile_path = save_dir / "gen.log"
+            tmp_logfile_path = save_dir / "tmp.log"
+            with open(gen_logfile_path,'r') as f:
+                filecontents = f.read().strip()
+            with self.create_logger(tmp_logfile_path) as logger:
+                file_contents = Parser(self.env, logger).parse_response(filecontents)
+                try:
+                    self.save_code(file_contents, results_dir, 0)
+                    logger.info("saved code sample %d", 0)
+                except Exception as e:
+                    logger.exception("got exception:\n%s", str(e), exc_info=e)
+                logger.info("-" * 80)
+                return
 
         save_dir = self.get_save_dir(results_dir)
         try:
@@ -253,11 +271,12 @@ class Task:
             f.write("")
         with self.create_logger(gen_logfile_path) as logger:
             logger.info(
-                "generating %s code samples at temp %s for task %s with reasoning effort %s",
+                "generating %s code samples at temp %s for task %s with reasoning effort %s or thinking tokens %s",
                 batch_size,
                 self.temperature,
                 self.id,
                 self.reasoning_effort,
+                self.max_thinking_tokens
             )
 
             prompter = Prompter(
@@ -269,6 +288,7 @@ class Task:
                 batch_size=batch_size,
                 temperature=self.temperature,
                 reasoning_effort=self.reasoning_effort,
+                max_thinking_tokens=self.max_thinking_tokens,
                 openrouter=openrouter,
             )
             logger.info("built prompt:\n%s", prompter.prompt)
@@ -284,6 +304,7 @@ class Task:
             except KeyboardInterrupt:
                 raise
             except Exception as e:
+                print(f"Got exception during prompting: {e}")
                 logger.exception("got exception:\n%s", str(e), exc_info=e)
                 return
 

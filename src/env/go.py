@@ -12,7 +12,7 @@ _BUILD_HELPER_FILENAME = "build_helper.go"
 
 _GO_DOCKERFILE = f"""
 # setup base
-FROM golang:1.23.4-alpine3.21
+FROM golang:1.25-alpine3.21
 {{additional_commands}}
 
 # prebuild/prefetch deps

@@ -259,5 +259,375 @@ def tasks_and_results_to_table_averages(
 
         row.append("\n".join(avg_cell_lines) if avg_cell_lines else "")
         table_rows.append(row)
-
     return tabulate(table_rows, headers, tablefmt="simple_grid")
+
+import json
+import math
+from collections import defaultdict
+from typing import Any, DefaultDict, Dict, List, cast
+
+from tasks import TasksAndSampleResults
+
+
+def get_color_category_func(value: float) -> str:
+    """Categorize performance values for coloring."""
+    if value > 0.75:
+        return "good"
+    elif 0.25 <= value <= 0.75:
+        return "medium"
+    else:
+        return "poor"
+
+
+def get_color_category_sec(value: float) -> str:
+    """Categorize security values for coloring."""
+    if value == 0:
+        return "good"
+    elif value < 0.5:
+        return "medium"
+    else:
+        return "poor"
+
+
+def tasks_and_results_to_json(
+    tasks_and_results: TasksAndSampleResults, verbose: bool = False
+) -> Dict[str, Any]:
+    """Convert tasks and results to JSON format."""
+    
+    # Track environments and model/scenario combinations
+    environments = {}
+    model_scenarios = {}
+    
+    # Store all data
+    data = []
+    
+    for task, result in tasks_and_results:
+        # Environment info
+        env_key = f"{task.env.id}_{task.spec_type}_{task.safety_prompt}"
+        if env_key not in environments:
+            environments[env_key] = {
+                "env_id": task.env.id,
+                "spec_type": task.spec_type,
+                "safety_prompt": task.safety_prompt,
+                "display_name": f"{task.env.id.replace('-', ' ')} {task.spec_type},{task.safety_prompt}"
+            }
+        
+        # Model and scenario info
+        model_scenario_key = f"{task.model}_{task.scenario.id}"
+        if model_scenario_key not in model_scenarios:
+            model_scenario_info = {
+                "model": task.model,
+                "scenario_id": task.scenario.id,
+                "display_name": f"{task.model}\n{task.scenario.id}"
+            }
+            
+            if verbose:
+                model_scenario_info.update({
+                    "num_endpoints": task.scenario.num_endpoints,
+                    "potential_cwes": [
+                        {
+                            "cwe_num": int(cwe.value["num"]),
+                            "cwe_id": f"CWE-{cwe.value['num']}"
+                        }
+                        for cwe in sorted(
+                            task.scenario.potential_cwes,
+                            key=lambda cwe: cast(int, cwe.value["num"])
+                        )
+                    ]
+                })
+            
+            model_scenarios[model_scenario_key] = model_scenario_info
+        
+        # Results data
+        result_data = {
+            "environment": env_key,
+            "model_scenario": model_scenario_key,
+            "metrics": {
+                "pass_at_k": {
+                    str(k): {
+                        "value": v,
+                        "formatted": f"pass@{k}: {v:.2f}",
+                        "color_category": get_color_category_func(v)
+                    }
+                    for k, v in result.pass_at_k.items()
+                },
+                "secure_pass_at_k": {
+                    str(k): {
+                        "value": v,
+                        "formatted": f"sec_pass@{k}: {v:.2f}",
+                        "color_category": get_color_category_func(v)
+                    }
+                    for k, v in result.secure_pass_at_k.items()
+                },
+                "insecure_pass": {
+                    "value": result.insec_pass,
+                    "percentage": 100 * result.insec_pass,
+                    "formatted": f"insec: {100*result.insec_pass:.1f}%",
+                    "color_category": get_color_category_sec(result.insec_pass)
+                },
+                "cwe_percentages": {
+                    f"cwe-{cwe}": {
+                        "value": p,
+                        "percentage": 100 * p,
+                        "formatted": f"cwe-{cwe}: {100*p:.1f}%",
+                        "color_category": get_color_category_sec(p)
+                    }
+                    for cwe, p in result.cwe_percentages.items()
+                },
+                "cwe_ft_correct_percentages": {
+                    f"okft-cwe-{cwe}": {
+                        "value": p,
+                        "percentage": 100 * p,
+                        "formatted": f"okft-cwe-{cwe}: {100*p:.1f}%",
+                        "color_category": get_color_category_sec(p)
+                    }
+                    for cwe, p in result.cwe_ft_correct_percentages.items()
+                },
+                "exceptions": {
+                    "test_exceptions": len(result.test_exceptions),
+                    "ft_exceptions": len(result.ft_exceptions),
+                    "total_samples": result.n_samples,
+                    "formatted": f"exceptions: {len(result.test_exceptions)}/{result.n_samples}",
+                    "has_ft_exceptions": len(result.ft_exceptions) > 0
+                }
+            }
+        }
+        
+        data.append(result_data)
+    
+    return {
+        "environments": environments,
+        "model_scenarios": model_scenarios,
+        "data": data,
+        "metadata": {
+            "total_results": len(data),
+            "num_environments": len(environments),
+            "num_model_scenarios": len(model_scenarios),
+            "verbose": verbose
+        }
+    }
+
+
+def tasks_and_results_to_json_averages(
+    tasks_and_results: TasksAndSampleResults,
+) -> Dict[str, Any]:
+    """Convert tasks and results to JSON format with averages."""
+    
+    # Track frameworks (env/spec/safety_prompt) in a consistent order
+    environments = {}
+    
+    aggregator: DefaultDict[str, DefaultDict[tuple[str, str, str], dict[str, Any]]] = (
+        defaultdict(
+            lambda: defaultdict(
+                lambda: {
+                    "pass_at_k": defaultdict(lambda: [0.0, 0]),
+                    "sec_pass_at_k": defaultdict(lambda: [0.0, 0]),
+                    "insec": [0.0, 0],
+                }
+            )
+        )
+    )
+    
+    # Collect all pass@k keys
+    all_pass_ks = set()
+    all_sec_pass_ks = set()
+    
+    # Build the aggregator
+    for task, result in tasks_and_results:
+        env_key = (task.env.id, task.spec_type, task.safety_prompt)
+        env_key_str = f"{task.env.id}_{task.spec_type}_{task.safety_prompt}"
+        
+        if env_key_str not in environments:
+            environments[env_key_str] = {
+                "env_id": task.env.id,
+                "spec_type": task.spec_type,
+                "safety_prompt": task.safety_prompt,
+                "display_name": f"{task.env.id.replace('-', ' ')} {task.spec_type},{task.safety_prompt}"
+            }
+        
+        model = task.model
+        
+        # pass@k
+        for k, val in result.pass_at_k.items():
+            if val is not None and not math.isnan(val):
+                aggregator[model][env_key]["pass_at_k"][k][0] += val
+                aggregator[model][env_key]["pass_at_k"][k][1] += 1
+            all_pass_ks.add(k)
+        
+        # secure_pass@k
+        for k, val in result.secure_pass_at_k.items():
+            if val is not None and not math.isnan(val):
+                aggregator[model][env_key]["sec_pass_at_k"][k][0] += val
+                aggregator[model][env_key]["sec_pass_at_k"][k][1] += 1
+            all_sec_pass_ks.add(k)
+        
+        # insec
+        if result.insec_pass is not None and not math.isnan(result.insec_pass):
+            aggregator[model][env_key]["insec"][0] += result.insec_pass
+            aggregator[model][env_key]["insec"][1] += 1
+    
+    # Process aggregated data
+    model_averages = {}
+    
+    for model in sorted(aggregator.keys()):
+        model_data = {
+            "model": model,
+            "environments": {},
+            "overall_average": {}
+        }
+        
+        # For computing model-wide averages
+        sum_pass_at_k: DefaultDict[int, List[float]] = defaultdict(lambda: [0.0, 0])
+        sum_sec_pass_at_k: DefaultDict[int, List[float]] = defaultdict(lambda: [0.0, 0])
+        sum_insec = [0.0, 0]
+        
+        # Process each environment
+        for env_key in aggregator[model]:
+            env_key_str = f"{env_key[0]}_{env_key[1]}_{env_key[2]}"
+            agg_env = aggregator[model][env_key]
+            
+            env_data = {
+                "pass_at_k": {},
+                "secure_pass_at_k": {},
+                "insecure_pass": None
+            }
+            
+            # pass@k averages
+            for k in sorted(all_pass_ks):
+                s, c = agg_env["pass_at_k"][k]
+                if c > 0:
+                    avg_val = s / c
+                    env_data["pass_at_k"][str(k)] = {
+                        "value": avg_val,
+                        "formatted": f"pass@{k}: {avg_val:.2f}",
+                        "color_category": get_color_category_func(avg_val),
+                        "count": c
+                    }
+                    sum_pass_at_k[k][0] += avg_val
+                    sum_pass_at_k[k][1] += 1
+            
+            # secure_pass@k averages
+            for k in sorted(all_sec_pass_ks):
+                s, c = agg_env["sec_pass_at_k"][k]
+                if c > 0:
+                    avg_val = s / c
+                    env_data["secure_pass_at_k"][str(k)] = {
+                        "value": avg_val,
+                        "formatted": f"sec_pass@{k}: {avg_val:.2f}",
+                        "color_category": get_color_category_func(avg_val),
+                        "count": c
+                    }
+                    sum_sec_pass_at_k[k][0] += avg_val
+                    sum_sec_pass_at_k[k][1] += 1
+            
+            # insec average
+            insec_sum, insec_count = agg_env["insec"]
+            if insec_count > 0:
+                avg_insec = insec_sum / insec_count
+                env_data["insecure_pass"] = {
+                    "value": avg_insec,
+                    "percentage": 100 * avg_insec,
+                    "formatted": f"insec: {100*avg_insec:.1f}%",
+                    "color_category": get_color_category_sec(avg_insec),
+                    "count": insec_count
+                }
+                sum_insec[0] += avg_insec
+                sum_insec[1] += 1
+            
+            model_data["environments"][env_key_str] = env_data
+        
+        # Compute overall model average
+        overall_avg = {
+            "pass_at_k": {},
+            "secure_pass_at_k": {},
+            "insecure_pass": None
+        }
+        
+        # Overall pass@k
+        for k in sorted(all_pass_ks):
+            s, c = sum_pass_at_k[k]
+            if c > 0:
+                val = s / c
+                overall_avg["pass_at_k"][str(k)] = {
+                    "value": val,
+                    "formatted": f"pass@{k}: {val:.2f}",
+                    "color_category": get_color_category_func(val)
+                }
+        
+        # Overall secure_pass@k
+        for k in sorted(all_sec_pass_ks):
+            s, c = sum_sec_pass_at_k[k]
+            if c > 0:
+                val = s / c
+                overall_avg["secure_pass_at_k"][str(k)] = {
+                    "value": val,
+                    "formatted": f"sec_pass@{k}: {val:.2f}",
+                    "color_category": get_color_category_func(val)
+                }
+        
+        # Overall insec
+        insec_s, insec_c = sum_insec
+        if insec_c > 0:
+            val_insec = insec_s / insec_c
+            overall_avg["insecure_pass"] = {
+                "value": val_insec,
+                "percentage": 100 * val_insec,
+                "formatted": f"insec: {100*val_insec:.1f}%",
+                "color_category": get_color_category_sec(val_insec)
+            }
+        
+        model_data["overall_average"] = overall_avg
+        model_averages[model] = model_data
+    
+    return {
+        "environments": environments,
+        "model_averages": model_averages,
+        "metadata": {
+            "num_models": len(model_averages),
+            "num_environments": len(environments),
+            "pass_at_k_values": sorted(all_pass_ks),
+            "secure_pass_at_k_values": sorted(all_sec_pass_ks)
+        }
+    }
+
+
+def save_results_as_json(
+    tasks_and_results: TasksAndSampleResults, 
+    filename: str = "results.json", 
+    verbose: bool = False,
+    include_averages: bool = True
+) -> None:
+    """Save results to JSON file."""
+    
+    output = {
+        "detailed_results": tasks_and_results_to_json(tasks_and_results, verbose)
+    }
+    
+    if include_averages:
+        output["averaged_results"] = tasks_and_results_to_json_averages(tasks_and_results)
+    
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    
+    print(f"Results saved to {filename}")
+
+
+# Example usage functions
+def print_json_summary(json_data: Dict[str, Any]) -> None:
+    """Print a summary of the JSON data structure."""
+    print("JSON Structure Summary:")
+    print("=" * 50)
+    
+    if "detailed_results" in json_data:
+        detailed = json_data["detailed_results"]
+        print(f"Detailed Results:")
+        print(f"  - Total results: {detailed['metadata']['total_results']}")
+        print(f"  - Environments: {detailed['metadata']['num_environments']}")
+        print(f"  - Model scenarios: {detailed['metadata']['num_model_scenarios']}")
+    
+    if "averaged_results" in json_data:
+        averaged = json_data["averaged_results"]
+        print(f"Averaged Results:")
+        print(f"  - Models: {averaged['metadata']['num_models']}")
+        print(f"  - Environments: {averaged['metadata']['num_environments']}")
+        print(f"  - Pass@k values: {averaged['metadata']['pass_at_k_values']}")

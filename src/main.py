@@ -7,7 +7,7 @@ from env import all_envs
 from env.aider_envs import all_aider_envs
 from env.openhands_envs import all_openhands_envs
 from env.base import Env
-from print import tasks_and_results_to_table, tasks_and_results_to_table_averages
+from print import tasks_and_results_to_table, tasks_and_results_to_table_averages, save_results_as_json
 from scenarios import all_scenarios
 from scenarios.base import Scenario
 from tasks import Task, TaskHandler
@@ -59,6 +59,9 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
 def main(args: argparse.Namespace) -> None:
 
     # ----- Run tasks -----#
+    # Validate spec_type
+    if "agent" in args.spec_type and args.models[0] not in ['aider','openhands','swe-agent']:
+        raise Exception("Bad specification type as model is not an agent!")
 
     if args.mode == "generate":
         # ----- Preparation -----#
@@ -85,6 +88,7 @@ def main(args: argparse.Namespace) -> None:
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
                     llm_model=getattr(args, 'llm_model', None),
+                    max_thinking_tokens=args.max_thinking_tokens,
                 )
                 for env in envs
                 for scenario in scenarios
@@ -92,7 +96,6 @@ def main(args: argparse.Namespace) -> None:
             ],
             key=lambda t: t.id,
         )
-
         task_handler = TaskHandler(
             tasks=tasks,
             results_dir=args.results_dir,
@@ -132,6 +135,7 @@ def main(args: argparse.Namespace) -> None:
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
                     llm_model=getattr(args, 'llm_model', None),
+                    max_thinking_tokens=args.max_thinking_tokens
                 )
                 for env in envs
                 for scenario in scenarios
@@ -175,6 +179,7 @@ def main(args: argparse.Namespace) -> None:
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
                     llm_model=args.llm_model,
+                    max_thinking_tokens=args.max_thinking_tokens
                 )
                 for env in envs
                 for scenario in scenarios
@@ -188,7 +193,6 @@ def main(args: argparse.Namespace) -> None:
             results_dir=args.results_dir,
             max_concurrent_runs=args.max_concurrent_runs,
         )
-
         r = task_handler.evaluate_results(
             ks=args.ks,
             samples=samples,
@@ -196,6 +200,7 @@ def main(args: argparse.Namespace) -> None:
         print(tasks_and_results_to_table_averages(r))
         print()
         print(tasks_and_results_to_table(r, verbose=False))
+        save_results_as_json(r, filename=pathlib.Path(args.results_dir, f"overall_results_{args.models[0]}_{args.reasoning_effort}.json"), verbose=True)
     else:
         raise Exception(f"Invalid mode: {args.mode}")
 
@@ -228,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reasoning_effort",
         type=str,
-        default="high",
+        default=None,
         choices=["low", "medium", "high"],
         help="The reasoning effort to use for reasoning models.",
     )
@@ -334,5 +339,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="LLM model to use for agents that support it (e.g., 'gpt-4o', 'gpt-5-mini-2025-08-07')",
+    )
+    parser.add_argument(
+        "--max_thinking_tokens",
+        type=int,
+        default=None, 
+        help="Maximum thinking budget for LLMs"
     )
     main(parser.parse_args())

@@ -12,13 +12,14 @@ from typing import Any, cast, Optional, Dict, List
 from venv import logger
 from docker.models.containers import Container
 import docker
+import requests
 
 from anthropic import Anthropic
 from anthropic.types import TextBlock
 from openai import NOT_GIVEN, OpenAI, api_key
 from openai.types.chat import ChatCompletionMessageParam
 
-from env.base import Env
+from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
 from scenarios.base import Scenario
 
 _SYSTEM_PROMPT = "You are an experienced full-stack developer"
@@ -613,6 +614,9 @@ class Prompter:
         "deepseek-ai/DeepSeek-R1": 164000,
         "openhands": 128000,  # OpenHands context (depends on underlying LLM)
         "aider": 128000,
+        "gpt-oss:20b": 131072,
+        "gpt-5-2025-08-07": 192000,
+        "Qwen/Qwen3-32B": 32768
     }
 
     openai_max_completion_tokens = {
@@ -620,9 +624,11 @@ class Prompter:
         "o1": 100000,
         "o1-mini": 65536,
         "o3-mini": 100000,
-        "gpt-oss-120b": 131072,
+        "gpt-oss:20b": 131072,
         "openhands": 32000,  # Generous limit for OpenHands output
         "aider": 32000,  # Generous limit for Aider output
+        "gpt-5-2025-08-07": 128000,
+        "Qwen/Qwen3-32B": 16384
     }
 
     openrouter_remap = {
@@ -643,6 +649,7 @@ class Prompter:
         batch_size: int,
         temperature: float,
         reasoning_effort: str,
+        max_thinking_tokens: str,
         openrouter: bool,
         openhands_timeout: int = 300,  # OpenHands task timeout
         openhands_max_iterations: int = 50,  # Max iterations for OpenHands
@@ -661,14 +668,16 @@ class Prompter:
         self.openhands_timeout = openhands_timeout
         self.openhands_max_iterations = openhands_max_iterations
         self.agent_port = agent_port
+        self.max_thinking_tokens = max_thinking_tokens
 
         self.system_prompt = _SYSTEM_PROMPT
         self.o1_o3 = model.startswith("o1") or model.startswith("o3")
         self.anthropic = "claude" in model
-        self.openai = self.o1_o3 or self.model.startswith("gpt")
+        self.openai = self.o1_o3 or self.model.startswith("gpt") and "oss" not in model
         self.openhands = model == "openhands"
         self.openrouter = openrouter and not (self.anthropic or self.openai or self.openhands)
-        self.local = "oss" in model
+        self.local = "oss" in model or not (self.anthropic or self.openai or self.openrouter or self.openhands)
+        print(f"Model={model} openrouter={self.openrouter} openai={self.openai} anthropic={self.anthropic} local={self.local} o1_o3={self.o1_o3} openhands={self.openhands}")
         self.aider = model == "aider"
 
         self.llm_model = llm_model
@@ -1027,22 +1036,23 @@ Please complete this development task autonomously. Create all necessary files, 
     def prompt_openai_together_batch(self, logger: logging.Logger) -> list[str]:
         if self.openai:
             client = OpenAI(api_key=os.environ[KeyLocs.openai_key.value])
-        elif self.local:  # for gpt-oss models
-            client = OpenAI(base_url=os.environ["LOCAL_API_BASE"])
+        elif self.local:  # for gpt-oss models via Ollama REST API
+            # breakpoint()
+            base_url = os.getenv("LOCAL_API_BASE", "http://127.0.0.1:11434").rstrip("/")
+            client = None  # we won't use the OpenAI SDK here
         else:
             client = OpenAI(
                 api_key=os.environ[KeyLocs.together_key.value],
                 base_url="https://api.together.xyz/v1",
             )
+
         try:
             # Prepare extra kwargs
             extra_kwargs: dict[str, Any] = {}
-            if self.model == "o1" or "oss" in self.model or '5' in self.model or self.model.startswith(
-                "o3"
-            ):  # NOTE: o1-mini does not have this
-                extra_kwargs["reasoning_effort"] = self.reasoning_effort
+            # if self.model == "o1" or "oss" in self.model or "5" in self.model or self.model.startswith("o3"):
+            #     extra_kwargs["reasoning_effort"] = self.reasoning_effort
             if self.openai:
-                extra_kwargs["max_completion_tokens"] = (
+                extra_kwargs["max_output_tokens"] = (
                     Prompter.openai_max_completion_tokens[self.model]
                 )
             else:
@@ -1051,51 +1061,98 @@ Please complete this development task autonomously. Create all necessary files, 
                     if self.model not in Prompter.openai_together_context_lengths
                     else Prompter.openai_together_context_lengths[self.model] - 2000
                 )
-            # Prepare the message
+
+            # Prepare the message(s)
             messages: list[Any] = []
-            if self.model == "o1" or self.model.startswith("o3") or "oss" in self.model or '5' in self.model:
-                messages.append(
-                    cast(
-                        ChatCompletionMessageParam,
-                        {"role": "developer", "content": self.system_prompt},
-                    )
-                )
+            if "oss" in self.model:
+                messages.append({"role": "system", "content": f"Reasoning effort: {self.reasoning_effort}\n\n"})
+            if self.model.lower() in REASONING_EFFORT_MODELS:
+                messages.append({"role": "developer", "content": self.system_prompt})
             elif self.model == "o1-mini":
-                # No sysprompt
-                pass
+                pass  # no sys prompt
             else:
-                messages.append(
-                    cast(
-                        ChatCompletionMessageParam,
-                        {"role": "system", "content": self.system_prompt},
-                    )
-                )
+                messages.append({"role": "system", "content": self.system_prompt})
             messages.append({"role": "user", "content": self.prompt})
 
-            # Query
-            completions = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                n=self.batch_size,
-                temperature=self.temperature if not self.o1_o3 else NOT_GIVEN,
-                **extra_kwargs,
-            )
-            if completions.usage is not None:
-                logger.info(
-                    f"Batch token stats: {completions.usage}; around {completions.usage.completion_tokens / self.batch_size:.2f} completion tokens per completion"
-                )
-            else:
-                logger.info(f"Batch token stats unavailable")
             responses = []
-            for idx, choice in enumerate(completions.choices):
-                if choice.finish_reason == "length":
-                    logger.warning(f"Completion {idx} was cut off due to length.")
-                if choice.message.content:
-                    responses.append(choice.message.content)
+
+            if self.local:
+                options = {
+                    "temperature": float(self.temperature),
+                    "num_predict": extra_kwargs.get("max_tokens"),
+                    "num_batch": 32,
+                }
+                if self.model.lower() in REASONING_TOKENS_MODELS:
+                    options['max_thinking_tokens']
+                # Call Ollama /api/chat directly (non-streaming)
+                url = f"{base_url}/api/chat"
+                headers = {"Content-Type": "application/json"}
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": float(self.temperature),
+                        "num_predict": extra_kwargs.get("max_tokens"),
+                        "num_batch": 32
+                        # "reasoning_effort": self.reasoning_effort if ("o1" in self.model or "o3" in self.model or "oss" in self.model) else None,
+                    },
+                }
+                r = requests.post(url, headers=headers, json=payload, timeout=600)
+                r.raise_for_status()
+                data = r.json()
+                content = data.get("message", {}).get("content", "") or data.get("response", "")
+                thinking = data.get("message", {}).get("thinking", "")
+                if thinking:
+                    merged = f"<think>{thinking}</think>{content}"
+                else:
+                    merged = content
+                responses.append(merged)
+
+            else:
+                # OpenAI / Together path unchanged
+                resp = client.responses.create(
+                    model=self.model,
+                    input=messages,
+                    reasoning={'effort': self.reasoning_effort, 'summary': 'detailed'} if ("o1" in self.model or "o3" in self.model or "5" in self.model) else NOT_GIVEN,
+                    # n=self.batch_size,
+                    temperature=self.temperature if not self.o1_o3 else NOT_GIVEN,
+                    **extra_kwargs,
+                    stream=False,
+                )
+                # if completions.usage is not None:
+                #     logger.info(
+                #         f"Batch token stats: {completions.usage}; around {completions.usage.completion_tokens / self.batch_size:.2f} completion tokens per completion"
+                #     )
+                # else:
+                #     logger.info("Batch token stats unavailable")
+
+                # for idx, choice in enumerate(completions.choices):
+                #     breakpoint()
+                #     if choice.finish_reason == "length":
+                #         logger.warning(f"Completion {idx} was cut off due to length.")
+                #     if choice.message.content:
+                #         responses.append(choice.message.content)
+
+                # Final answer text
+                output_text = getattr(resp, "output_text", "") or ""
+
+                # Reasoning summary text
+                reasoning_text = ""
+                reasoning_item = next((it for it in resp.output or [] if it.type == "reasoning"), None)
+                if reasoning_item and getattr(reasoning_item, "summary", None):
+                    reasoning_text = "\n".join(s.text for s in reasoning_item.summary)
+                
+                model_output = '<think>' + reasoning_text + "</think>\n" + output_text if reasoning_text else output_text
+                # model_output = '<thinking summary>' + resp.reasoning.summary + '</thinking summary>' + model_output if resp.reasoning and resp.reasoning.summary else model_output
+                responses.append(model_output)
+
             return responses
 
         except Exception as e:
             raise e
+    
+    
 
     def prompt_model(self, logger: logging.Logger) -> list[str]:
         if self.anthropic:
@@ -1158,9 +1215,11 @@ class Parser:
         return {pathlib.Path("failed"): "Format not found. Full response:\n" + response}
 
     def _parse_md(self, response: str) -> list[str]:
+        response = response.split("</think>")[-1]
         return [s.strip() for s in self.md_pattern.findall(response)]
 
     def _parse_code(self, response: str) -> list[str]:
+        response = response.split("</think>")[-1].split("--------------------")[0]
         return [s.strip() for s in self.code_pattern.findall(response)]
 
     def _parse_aider_response(self, response: str) -> dict[pathlib.Path, str]:
