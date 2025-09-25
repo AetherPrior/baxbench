@@ -670,6 +670,8 @@ class Prompter:
         self.agent_port = agent_port
         self.max_thinking_tokens = max_thinking_tokens
 
+        self.completions = False # set true for experimenting with reasoning
+        
         self.system_prompt = _SYSTEM_PROMPT
         self.o1_o3 = model.startswith("o1") or model.startswith("o3")
         self.anthropic = "claude" in model
@@ -1034,10 +1036,10 @@ Please complete this development task autonomously. Create all necessary files, 
             raise e
 
     def prompt_openai_together_batch(self, logger: logging.Logger) -> list[str]:
+
         if self.openai:
             client = OpenAI(api_key=os.environ[KeyLocs.openai_key.value])
         elif self.local:  # for gpt-oss models via Ollama REST API
-            # breakpoint()
             base_url = os.getenv("LOCAL_API_BASE", "http://127.0.0.1:11434").rstrip("/")
             client = None  # we won't use the OpenAI SDK here
         else:
@@ -1076,14 +1078,7 @@ Please complete this development task autonomously. Create all necessary files, 
 
             responses = []
 
-            if self.local:
-                options = {
-                    "temperature": float(self.temperature),
-                    "num_predict": extra_kwargs.get("max_tokens"),
-                    "num_batch": 32,
-                }
-                if self.model.lower() in REASONING_TOKENS_MODELS:
-                    options['max_thinking_tokens']
+            if self.local and not self.completions:
                 # Call Ollama /api/chat directly (non-streaming)
                 url = f"{base_url}/api/chat"
                 headers = {"Content-Type": "application/json"}
@@ -1094,8 +1089,6 @@ Please complete this development task autonomously. Create all necessary files, 
                     "options": {
                         "temperature": float(self.temperature),
                         "num_predict": extra_kwargs.get("max_tokens"),
-                        "num_batch": 32
-                        # "reasoning_effort": self.reasoning_effort if ("o1" in self.model or "o3" in self.model or "oss" in self.model) else None,
                     },
                 }
                 r = requests.post(url, headers=headers, json=payload, timeout=600)
@@ -1109,51 +1102,78 @@ Please complete this development task autonomously. Create all necessary files, 
                     merged = content
                 responses.append(merged)
 
+            elif self.completions: 
+                # Convert messages to Qwen3 chat template format
+                def format_qwen3_prompt(messages):
+                    formatted_parts = []
+                    
+                    for message in messages:
+                        role = message.get("role", "")
+                        content = message.get("content", "")
+                        
+                        if role == "system":
+                            formatted_parts.append(f"<|im_start|>system\n{content}<|im_end|>")
+                        elif role == "user":
+                            formatted_parts.append(f"<|im_start|>user\n{content}<|im_end|>")
+                        elif role == "assistant":
+                            formatted_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+                    
+                    # Add the assistant start token for generation
+                    formatted_parts.append("<|im_start|>assistant\n")
+                    
+                    return "\n".join(formatted_parts)
+                
+                # Call Ollama /api/generate for completions
+                url = f"{base_url}/api/generate"
+                headers = {"Content-Type": "application/json"}
+                
+                formatted_prompt = format_qwen3_prompt(messages)
+                
+                payload = {
+                    "model": self.model,
+                    "prompt": formatted_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": float(self.temperature),
+                        "num_predict": extra_kwargs.get("max_tokens"),
+                        "stop": ["<|im_end|>", "<|endoftext|>"]  # Stop tokens for Qwen3
+                    },
+                }
+                
+                r = requests.post(url, headers=headers, json=payload, timeout=600)
+                r.raise_for_status()
+                data = r.json()
+                
+                content = data.get("response", "")
+                responses.append(content)
+
             else:
                 # OpenAI / Together path unchanged
-                resp = client.responses.create(
+                completions = client.chat.completions.create(
                     model=self.model,
-                    input=messages,
-                    reasoning={'effort': self.reasoning_effort, 'summary': 'detailed'} if ("o1" in self.model or "o3" in self.model or "5" in self.model) else NOT_GIVEN,
-                    # n=self.batch_size,
+                    messages=messages,
+                    n=self.batch_size,
                     temperature=self.temperature if not self.o1_o3 else NOT_GIVEN,
                     **extra_kwargs,
-                    stream=False,
                 )
-                # if completions.usage is not None:
-                #     logger.info(
-                #         f"Batch token stats: {completions.usage}; around {completions.usage.completion_tokens / self.batch_size:.2f} completion tokens per completion"
-                #     )
-                # else:
-                #     logger.info("Batch token stats unavailable")
+                if completions.usage is not None:
+                    logger.info(
+                        f"Batch token stats: {completions.usage}; around {completions.usage.completion_tokens / self.batch_size:.2f} completion tokens per completion"
+                    )
+                else:
+                    logger.info("Batch token stats unavailable")
 
-                # for idx, choice in enumerate(completions.choices):
-                #     breakpoint()
-                #     if choice.finish_reason == "length":
-                #         logger.warning(f"Completion {idx} was cut off due to length.")
-                #     if choice.message.content:
-                #         responses.append(choice.message.content)
-
-                # Final answer text
-                output_text = getattr(resp, "output_text", "") or ""
-
-                # Reasoning summary text
-                reasoning_text = ""
-                reasoning_item = next((it for it in resp.output or [] if it.type == "reasoning"), None)
-                if reasoning_item and getattr(reasoning_item, "summary", None):
-                    reasoning_text = "\n".join(s.text for s in reasoning_item.summary)
-                
-                model_output = '<think>' + reasoning_text + "</think>\n" + output_text if reasoning_text else output_text
-                # model_output = '<thinking summary>' + resp.reasoning.summary + '</thinking summary>' + model_output if resp.reasoning and resp.reasoning.summary else model_output
-                responses.append(model_output)
+                for idx, choice in enumerate(completions.choices):
+                    if choice.finish_reason == "length":
+                        logger.warning(f"Completion {idx} was cut off due to length.")
+                    if choice.message.content:
+                        responses.append(choice.message.content)
 
             return responses
 
         except Exception as e:
             raise e
     
-    
-
     def prompt_model(self, logger: logging.Logger) -> list[str]:
         if self.anthropic:
             return self.prompt_anthropic(logger)
