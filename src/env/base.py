@@ -231,4 +231,4 @@ COMMON_DOCKER_RUN_COMMANDS = [
 ]
 
 REASONING_EFFORT_MODELS = ["o1", "o3", "gpt-oss:20b", "gpt-oss:120b", "gpt-5-2025-08-07"]
-REASONING_TOKENS_MODELS = ['qwen3:32b', 'claude-4-sonnet','Qwen/Qwen3-32B']
+REASONING_TOKENS_MODELS = ['qwen3:32b', 'claude-4-sonnet','qwen/qwen3-32b']

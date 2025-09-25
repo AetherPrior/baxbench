@@ -1063,7 +1063,6 @@ Please complete this development task autonomously. Create all necessary files, 
                     if self.model not in Prompter.openai_together_context_lengths
                     else Prompter.openai_together_context_lengths[self.model] - 2000
                 )
-
             # Prepare the message(s)
             messages: list[Any] = []
             if "oss" in self.model:
@@ -1082,14 +1081,19 @@ Please complete this development task autonomously. Create all necessary files, 
                 # Call Ollama /api/chat directly (non-streaming)
                 url = f"{base_url}/api/chat"
                 headers = {"Content-Type": "application/json"}
+                options = {
+                        "temperature": float(self.temperature),
+                        "num_predict": extra_kwargs.get("max_tokens"),
+                    }
+                
+                if self.max_thinking_tokens and self.model.lower() in REASONING_TOKENS_MODELS:
+                    options['max_thinking_tokens'] = self.max_thinking_tokens
+
                 payload = {
                     "model": self.model,
                     "messages": messages,
                     "stream": False,
-                    "options": {
-                        "temperature": float(self.temperature),
-                        "num_predict": extra_kwargs.get("max_tokens"),
-                    },
+                    "options": options
                 }
                 r = requests.post(url, headers=headers, json=payload, timeout=600)
                 r.raise_for_status()
