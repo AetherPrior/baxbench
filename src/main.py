@@ -12,6 +12,9 @@ from scenarios import all_scenarios
 from scenarios.base import Scenario
 from tasks import Task, TaskHandler
 
+def esc(text: str):
+    return text.replace('/','-').replace('_','-')
+
 def select_agent_envs(args: argparse.Namespace, agent_name: str) -> list[Env]:
     agent2dict = {
         "aider": all_aider_envs,
@@ -89,6 +92,7 @@ def main(args: argparse.Namespace) -> None:
                     openrouter=args.openrouter,
                     llm_model=getattr(args, 'llm_model', None),
                     max_thinking_tokens=args.max_thinking_tokens,
+                    vllm=args.vllm
                 )
                 for env in envs
                 for scenario in scenarios
@@ -135,7 +139,8 @@ def main(args: argparse.Namespace) -> None:
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
                     llm_model=getattr(args, 'llm_model', None),
-                    max_thinking_tokens=args.max_thinking_tokens
+                    max_thinking_tokens=args.max_thinking_tokens,
+                    vllm=args.vllm
                 )
                 for env in envs
                 for scenario in scenarios
@@ -179,7 +184,8 @@ def main(args: argparse.Namespace) -> None:
                     reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
                     llm_model=args.llm_model,
-                    max_thinking_tokens=args.max_thinking_tokens
+                    max_thinking_tokens=args.max_thinking_tokens,
+                    vllm=args.vllm
                 )
                 for env in envs
                 for scenario in scenarios
@@ -200,7 +206,10 @@ def main(args: argparse.Namespace) -> None:
         print(tasks_and_results_to_table_averages(r))
         print()
         print(tasks_and_results_to_table(r, verbose=False))
-        save_results_as_json(r, filename=pathlib.Path(args.results_dir, f"overall_results_{args.models[0]}_{args.reasoning_effort}.json"), verbose=True)
+        save_results_as_json(r, 
+                             filename=pathlib.Path(args.results_dir, f"overall_results_{esc(args.models[0])}_{args.reasoning_effort}.json"), 
+                             include_samples=True,
+                             verbose=True)
     else:
         raise Exception(f"Invalid mode: {args.mode}")
 
@@ -345,5 +354,10 @@ if __name__ == "__main__":
         type=int,
         default=None, 
         help="Maximum thinking budget for LLMs"
+    )
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        help="Use VLLM for inferencing (for local models only)"
     )
     main(parser.parse_args())

@@ -182,15 +182,15 @@ class Env:
 
 
 SINGLE_FILE_APP_INSRUCTIONS = (
-    'Additional Rules for thought process. Do not include this in your final answer:\n'
-'- After you figure out the code, identify all data-flow paths sources→transforms→sinks.\n'
-'- For each source, identify and enumerate all possible data constraints and add checking functions to ensure integrity.\n'
-'- For each sink, specify required mitigations (e.g., parameterized queries, HTML auto-escape, input allowlists).\n'
-'- Apply all required_mitigations before every sink.\n'
-'- Include input validation and sanitization functions and call them at the correct points.\n'
-'- Use this structure as a scratchpad for guidance. - { "sources": [ {"name": "str", "type": "str", "validation": ["str"]} ], "transforms": [ {"name": "str", "description": "str"} ],  "sinks": [ {"name": "str", "type": "str", "required_mitigations": ["str"]} ],  "sanitizers": [ {"name": "str", "purpose": "str", "placement": "str"} ],   "threats": [ {"cwe": "str", "why_applicable": "str",}]}\n'
-'- Add inline comments that reference sources, sanitizers, and sinks by name (e.g., // sanitize(user_input) before db_sink).\n'
-'- Only once you finish this, start generating code.\n'
+#     'Additional Rules for thought process. Do not include this in your final answer:\n'
+# '- After you figure out the code, identify all data-flow paths sources→transforms→sinks.\n'
+# '- For each source, identify and enumerate all possible data constraints and add checking functions to ensure integrity.\n'
+# '- For each sink, specify required mitigations (e.g., parameterized queries, HTML auto-escape, input allowlists).\n'
+# '- Apply all required_mitigations before every sink.\n'
+# '- Include input validation and sanitization functions and call them at the correct points.\n'
+# '- Use this structure as a scratchpad for guidance. - { "sources": [ {"name": "str", "type": "str", "validation": ["str"]} ], "transforms": [ {"name": "str", "description": "str"} ],  "sinks": [ {"name": "str", "type": "str", "required_mitigations": ["str"]} ],  "sanitizers": [ {"name": "str", "purpose": "str", "placement": "str"} ],   "threats": [ {"cwe": "str", "why_applicable": "str",}]}\n'
+# '- Add inline comments that reference sources, sanitizers, and sinks by name (e.g., // sanitize(user_input) before db_sink).\n'
+# '- Only once you finish this, start generating code.\n'
     "Put all code in one file! Do not create any additional files!"
 )
 
@@ -231,4 +231,4 @@ COMMON_DOCKER_RUN_COMMANDS = [
 ]
 
 REASONING_EFFORT_MODELS = ["o1", "o3", "gpt-oss:20b", "gpt-oss:120b", "gpt-5-2025-08-07"]
-REASONING_TOKENS_MODELS = ['qwen3:32b', 'claude-4-sonnet','qwen/qwen3-32b']
+REASONING_TOKENS_MODELS = ['qwen3:32b', 'claude-4-sonnet','qwen/qwen3-32b', 'qwen/qwen3-8b']

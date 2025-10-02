@@ -112,6 +112,7 @@ class Task:
     safety_prompt: str
     openrouter: bool
     llm_model: Optional[str]
+    vllm: Optional[bool] = False
 
     @property
     def id(self) -> str:
@@ -137,9 +138,9 @@ class Task:
     def get_save_dir(self, results_dir: pathlib.Path) -> pathlib.Path:
         model_reasoning = esc(self.model) 
         if self.reasoning_effort and self.model.lower() in REASONING_EFFORT_MODELS:
-            model_reasoning += f"_{esc(self.reasoning_effort)}"
-        elif self.model.lower() in REASONING_TOKENS_MODELS and self.max_thinking_tokens: # TODO CHANGE
-            model_reasoning += f"_{esc(self.max_thinking_tokens)}"
+            model_reasoning += f"-{esc(self.reasoning_effort)}"
+        elif self.model.lower() in REASONING_TOKENS_MODELS: # TODO CHANGE
+            model_reasoning += f"-{esc(str(self.max_thinking_tokens))}"
         save_dir = (
             results_dir
             / model_reasoning
@@ -243,20 +244,21 @@ class Task:
             )
             and not force
         ):
-            save_dir = self.get_save_dir(results_dir)
-            gen_logfile_path = save_dir / "gen.log"
-            tmp_logfile_path = save_dir / "tmp.log"
-            with open(gen_logfile_path,'r') as f:
-                filecontents = f.read().strip()
-            with self.create_logger(tmp_logfile_path) as logger:
-                file_contents = Parser(self.env, logger).parse_response(filecontents)
-                try:
-                    self.save_code(file_contents, results_dir, 0)
-                    logger.info("saved code sample %d", 0)
-                except Exception as e:
-                    logger.exception("got exception:\n%s", str(e), exc_info=e)
-                logger.info("-" * 80)
-                return
+            # save_dir = self.get_save_dir(results_dir)
+            # gen_logfile_path = save_dir / "gen.log"
+            # tmp_logfile_path = save_dir / "tmp.log"
+            # with open(gen_logfile_path,'r') as f:
+            #     filecontents = f.read().strip()
+            # with self.create_logger(tmp_logfile_path) as logger:
+            #     file_contents = Parser(self.env, logger).parse_response(filecontents)
+            #     try:
+            #         self.save_code(file_contents, results_dir, 0)
+            #         logger.info("saved code sample %d", 0)
+            #     except Exception as e:
+            #         logger.exception("got exception:\n%s", str(e), exc_info=e)
+            #     logger.info("-" * 80)
+            #     return
+            return
 
         save_dir = self.get_save_dir(results_dir)
         try:
@@ -290,6 +292,7 @@ class Task:
                 reasoning_effort=self.reasoning_effort,
                 max_thinking_tokens=self.max_thinking_tokens,
                 openrouter=openrouter,
+                vllm=self.vllm
             )
             logger.info("built prompt:\n%s", prompter.prompt)
             logger.info("-" * 100)
@@ -405,7 +408,8 @@ class Task:
                         openrouter=openrouter,
                         agent_port=None,  # No agent port needed for local runtime
                         container=cr.container,  # Pass container for any needed coordination
-                        llm_model=getattr(self, 'llm_model', 'anthropic/claude-3-sonnet-20240229')
+                        llm_model=getattr(self, 'llm_model', 'anthropic/claude-3-sonnet-20240229'),
+                        vllm=self.vllm
                     )
                     logger.info("built OpenHands prompt:\n%s", prompter.prompt)
                     logger.info("-" * 100)
@@ -534,7 +538,8 @@ class Task:
                         openrouter=openrouter,
                         agent_port=cr.agent_port,
                         container=cr.container,
-                        llm_model=getattr(self, 'llm_model', None)
+                        llm_model=getattr(self, 'llm_model', None),
+                        vllm=self.vllm
                     )
                     logger.info("built Aider prompt:\n%s", prompter.prompt)
                     logger.info("-" * 100)

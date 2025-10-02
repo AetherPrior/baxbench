@@ -23,6 +23,7 @@ from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+import re
 
 
 def extract_model_name(json_filename: str) -> str:
@@ -46,34 +47,61 @@ def parse_environment_config(env_key: str) -> Dict[str, str]:
     }
 
 
-def find_cwe_scenarios(data: Dict, model) -> List[Dict]:
-    """Find all scenarios with CWE vulnerabilities."""
+def find_cwe_scenarios(data: Dict, model: str) -> List[Dict]:
+    """Classify scenarios into CWE-hit, secure (no CWE + some pass), and failed (no pass)."""
     cwe_scenarios = []
-    
+    non_cwe_scenarios = []
+    failed_scenarios = []
+
     for result in data['detailed_results']['data']:
         env_config = parse_environment_config(result['environment'])
         scenario_parts = result['model_scenario'].split('_')
+        # strip difficulty token if present
+        if len(scenario_parts) >= 3 and scenario_parts[1] in {'low', 'medium', 'med', 'high'}:
+            scenario_parts = [scenario_parts[0]] + scenario_parts[2:]
         scenario = '_'.join(scenario_parts[1:])
-        
-        # Check if this result has CWE vulnerabilities
-        cwe_percentages = result['metrics'].get('cwe_percentages', {})
-        func_correct = result['metrics'].get('pass_at_k', {})
-        for (k, passed), (cwe, cwe_data) in zip(func_correct.items(), cwe_percentages.items()):
-            if cwe_data['value'] > 0 and passed['value'] > 0:  # CWE vulnerability found
-                if cwe == 'cwe-703':
-                    breakpoint()
-                cwe_scenarios.append({
-                    'model': model,
-                    'scenario': scenario,
-                    'env_id': env_config['env_id'],
-                    'spec_type': env_config['spec_type'],
-                    'safety_prompt': env_config['safety_prompt'],
-                    'cwe': cwe,
-                    'cwe_percentage': cwe_data['percentage']
-                })
-    
-    return cwe_scenarios
 
+        metrics = result.get('metrics', {})
+        flags = result.get('derived_flags', {})
+
+        # Prefer explicit flags if present
+        has_any_cwe = bool(flags.get('has_any_cwe', False))
+        any_pass = bool(flags.get('any_pass', False))
+        any_secure_pass = bool(flags.get('any_secure_pass', False))
+
+        # Fallback if flags are absent
+        if not flags:
+            cwe_percentages = metrics.get('cwe_percentages', {})
+            pass_at_k = metrics.get('pass_at_k', {})
+            sec_pass_at_k = metrics.get('secure_pass_at_k', {})
+
+            def _any_val_gt0(d):
+                return any((v or {}).get('value', 0) > 0 for v in d.values())
+
+            has_any_cwe = any((v or {}).get('value', 0) > 0 for v in cwe_percentages.values())
+            any_pass = _any_val_gt0(pass_at_k)
+            any_secure_pass = _any_val_gt0(sec_pass_at_k)
+
+        base = {
+            'model': model,
+            'scenario': scenario,
+            'env_id': env_config['env_id'],
+            'spec_type': env_config['spec_type'],
+            'safety_prompt': env_config['safety_prompt'],
+        }
+
+        if any_pass and has_any_cwe:
+            # collect all CWEs present (not just one)
+            cwes = [c for c, v in metrics.get('cwe_percentages', {}).items() if (v or {}).get('value', 0) > 0]
+            entry = dict(base)
+            entry['cwes'] = cwes
+            cwe_scenarios.append(entry)
+        elif any_pass and not has_any_cwe:
+            non_cwe_scenarios.append(base)
+        else:
+            failed_scenarios.append(base)
+
+    return cwe_scenarios, non_cwe_scenarios, failed_scenarios
 
 def construct_source_paths(base_dir: str, scenario_info: Dict, temperature: str, model: str) -> Dict[str, str]:
     """Construct source file paths based on the folder structure."""
@@ -98,15 +126,24 @@ def construct_source_paths(base_dir: str, scenario_info: Dict, temperature: str,
 
 def construct_target_filename(scenario_info: Dict, log_type: str, temperature: str) -> str:
     """Construct target filename for the organized logs."""
-    cwe = scenario_info['cwe']
+
     scenario = scenario_info['scenario']
     env_id = scenario_info['env_id'].replace('-', '')  # e.g., "Python-Flask" -> "PythonFlask"
     temp_str = temperature
     spec_type = scenario_info['spec_type']
     safety_prompt = scenario_info['safety_prompt']
+    try:
+        cwe = scenario_info['cwe']    
+        return f"{cwe}_{log_type}_{scenario}_{env_id}_{temp_str}_{spec_type}_{safety_prompt}.log"
+    except:
+        return f"{log_type}_{scenario}_{env_id}_{temp_str}_{spec_type}_{safety_prompt}.log"
     
-    return f"{cwe}_{log_type}_{scenario}_{env_id}_{temp_str}_{spec_type}_{safety_prompt}.log"
+            
 
+
+
+def esc_model_name(text: str): 
+    return re.sub(r'_|/|:', '-', text)
 
 def plot_model_results(data: Dict, model_name: str, output_dir: Path):
     """Create comprehensive plots for model evaluation results."""
@@ -122,7 +159,7 @@ def plot_model_results(data: Dict, model_name: str, output_dir: Path):
     # Get the model data (assuming single model)
     model_data = None
     for model_key, model_info in model_averages.items():
-        if model_key.replace(':', '') in model_name.replace(':', ''):
+        if esc_model_name(model_key) in esc_model_name(model_name):
             model_data = model_info
             break
     
@@ -143,10 +180,10 @@ def plot_model_results(data: Dict, model_name: str, output_dir: Path):
         # Clean up environment name for display
         env_display = env_key.replace('_openapi_specific', '').replace('-', ' ')
         env_names.append(env_display)
-        
         pass_at_k_values.append(env_data.get('pass_at_k', {}).get('1', {}).get('value', 0) * 100)
         sec_pass_at_k_values.append(env_data.get('secure_pass_at_k', {}).get('1', {}).get('value', 0) * 100)
-        insecure_pass_values.append(env_data.get('insecure_pass', {}).get('percentage', 0))
+        insecure_pass = env_data.get('insecure_pass', {})
+        insecure_pass_values.append(0 if insecure_pass is None else insecure_pass.get('percentage',0))
     
     # Create the main plot
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
@@ -389,11 +426,11 @@ Example usage:
         help='Root directory containing the model results (default: current directory)'
     )
     
-    parser.add_argument(
-        '--target-suffix',
-        default='cwes',
-        help='Suffix for the target directory name (default: "cwes", creates "{model_name}_cwes")'
-    )
+    # parser.add_argument(
+    #     '--target-suffix',
+    #     default='cwes',
+    #     help='Suffix for the target directory name (default: "cwes", creates "{model_name}_cwes")'
+    # )
     
     parser.add_argument(
         '--dry-run',
@@ -445,7 +482,8 @@ def organize_cwe_logs_main(args):
             print(f"Processing model: {model_name}")
         
         # Create target directory for outputs
-        target_dir = Path(f"{model_name}_{args.target_suffix}")
+        target_suffix = 'cwes'
+        target_dir = Path(f"{model_name}_{target_suffix}")
         if not args.dry_run:
             target_dir.mkdir(exist_ok=True)
         
@@ -468,7 +506,8 @@ def organize_cwe_logs_main(args):
             return
         
         # Find scenarios with CWE vulnerabilities
-        cwe_scenarios = find_cwe_scenarios(data, model_name)
+        cwe_scenarios, non_cwe_scenarios, failed_scenarios = find_cwe_scenarios(data, model_name)
+        
         print(f"Found {len(cwe_scenarios)} scenarios with CWE vulnerabilities")
         
         if not cwe_scenarios:
@@ -477,66 +516,71 @@ def organize_cwe_logs_main(args):
         
         print(f"{'Would create' if args.dry_run else 'Created/using'} directory: {target_dir}")
         
-        # Process each CWE scenario
-        copied_count = 0
-        missing_files = []
-        
-        for scenario_info in cwe_scenarios:
-            if args.verbose or args.dry_run:
-                print(f"\nProcessing CWE {scenario_info['cwe']} in {scenario_info['scenario']} "
-                      f"({scenario_info['env_id']}) - {scenario_info['cwe_percentage']:.1f}%")
-            
-            # Get source paths
-            source_paths = construct_source_paths(args.source_dir, scenario_info, args.temperature, model_name)
-            
-            # Process gen.log
-            gen_source = source_paths['gen_log']
-            gen_target = target_dir / construct_target_filename(scenario_info, 'gen', args.temperature)
-            
-            if gen_source.exists():
-                if args.dry_run:
-                    print(f"  Would copy gen.log -> {gen_target.name}")
-                else:
-                    shutil.copy2(gen_source, gen_target)
-                    if args.verbose:
-                        print(f"  ✓ Copied gen.log -> {gen_target.name}")
-                copied_count += 1
-            else:
-                missing_files.append(f"gen.log: {gen_source}")
+        def process_scenarios(scenarios, target_suffix):
+            copied_count = 0
+            missing_files = []
+
+            # ensure the directory exists for this bucket
+            target_dir = Path(f'{esc_model_name(model_name)}_{target_suffix}')
+            if not args.dry_run:
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+            for scenario_info in scenarios:
                 if args.verbose or args.dry_run:
-                    print(f"  ✗ Missing: {gen_source}")
-            
-            # Process test.log
-            test_source = source_paths['test_log']
-            test_target = target_dir / construct_target_filename(scenario_info, 'test', args.temperature)
-            
-            if test_source.exists():
-                if args.dry_run:
-                    print(f"  Would copy test.log -> {test_target.name}")
+                    print(f"\nProcessing {scenario_info.get('scenario','<unknown>')} ({scenario_info.get('env_id','?')})")
+
+                source_paths = construct_source_paths(args.source_dir, scenario_info, args.temperature, model_name)
+
+                gen_source = source_paths['gen_log']
+                gen_target = target_dir / construct_target_filename(scenario_info, 'gen', args.temperature)
+
+                if gen_source.exists():
+                    if args.dry_run:
+                        print(f"  Would copy gen.log -> {gen_target.name}")
+                    else:
+                        shutil.copy2(gen_source, gen_target)
+                        if args.verbose:
+                            print(f"  ✓ Copied gen.log -> {gen_target.name}")
+                    copied_count += 1
                 else:
-                    shutil.copy2(test_source, test_target)
-                    if args.verbose:
-                        print(f"  ✓ Copied test.log -> {test_target.name}")
-                copied_count += 1
-            else:
-                missing_files.append(f"test.log: {test_source}")
-                if args.verbose or args.dry_run:
-                    print(f"  ✗ Missing: {test_source}")
+                    missing_files.append(f"gen.log: {gen_source}")
+                    if args.verbose or args.dry_run:
+                        print(f"  ✗ Missing: {gen_source}")
+
+                test_source = source_paths['test_log']
+                test_target = target_dir / construct_target_filename(scenario_info, 'test', args.temperature)
+
+                if test_source.exists():
+                    if args.dry_run:
+                        print(f"  Would copy test.log -> {test_target.name}")
+                    else:
+                        shutil.copy2(test_source, test_target)
+                        if args.verbose:
+                            print(f"  ✓ Copied test.log -> {test_target.name}")
+                    copied_count += 1
+                else:
+                    missing_files.append(f"test.log: {test_source}")
+                    if args.verbose or args.dry_run:
+                        print(f"  ✗ Missing: {test_source}")
+
+            print(f"\n=== Summary ({target_suffix}) ===")
+            action = "Would copy" if args.dry_run else "Copied"
+            print(f"Total files {action.lower()}: {copied_count}")
+            print(f"Missing files: {len(missing_files)}")
+
+            if missing_files and args.verbose:
+                print("\nMissing files:")
+                for m in missing_files:
+                    print(f"  - {m}")
+
+            if not args.dry_run:
+                print(f"\nOrganized logs in: {target_dir.absolute()}")
+
+        process_scenarios(cwe_scenarios, target_suffix='cwes')
+        process_scenarios(non_cwe_scenarios, target_suffix='sec')
+        process_scenarios(failed_scenarios, 'failed')
         
-        # Summary
-        print(f"\n=== Summary ===")
-        action = "Would copy" if args.dry_run else "Copied"
-        print(f"Total files {action.lower()}: {copied_count}")
-        print(f"Missing files: {len(missing_files)}")
-        
-        if missing_files and args.verbose:
-            print("\nMissing files:")
-            for missing in missing_files:
-                print(f"  - {missing}")
-        
-        if not args.dry_run:
-            print(f"\nAll CWE logs organized in: {target_dir.absolute()}")
-        
+          
     except Exception as e:
         print(f"Error: {e}")
         if args.verbose:

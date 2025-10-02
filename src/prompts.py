@@ -22,6 +22,9 @@ from openai.types.chat import ChatCompletionMessageParam
 from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
 from scenarios.base import Scenario
 
+
+from completions_runner import run_vllm_completions
+
 _SYSTEM_PROMPT = "You are an experienced full-stack developer"
 
 
@@ -656,6 +659,7 @@ class Prompter:
         agent_port: Optional[int] = None,  # Port where OpenHands API server is running
         container: Optional[Container] = None,  # Docker container for Aider
         llm_model: Optional[str] = None,  # LLM model to use for agents that support it
+        vllm: bool = False
     ):
         self.env = env
         self.scenario = scenario
@@ -670,7 +674,7 @@ class Prompter:
         self.agent_port = agent_port
         self.max_thinking_tokens = max_thinking_tokens
 
-        self.completions = False # set true for experimenting with reasoning
+        self.completions = True # set true for experimenting with reasoning
         
         self.system_prompt = _SYSTEM_PROMPT
         self.o1_o3 = model.startswith("o1") or model.startswith("o3")
@@ -681,6 +685,7 @@ class Prompter:
         self.local = "oss" in model or not (self.anthropic or self.openai or self.openrouter or self.openhands)
         print(f"Model={model} openrouter={self.openrouter} openai={self.openai} anthropic={self.anthropic} local={self.local} o1_o3={self.o1_o3} openhands={self.openhands}")
         self.aider = model == "aider"
+        self.vllm = vllm
 
         self.llm_model = llm_model
         self.prompt = self.scenario.build_prompt(
@@ -966,24 +971,154 @@ Please complete this development task autonomously. Create all necessary files, 
 
     def prompt_anthropic(self, logger: logging.Logger) -> list[str]:
         client = Anthropic(api_key=os.environ[KeyLocs.anthropic_key.value])
+        
+        # Updated token limits for Claude 4 family
+        token_limits = {
+            'claude-3-5-': 8192,
+            'claude-4': 16384,
+            'claude-sonnet-4.5': 16384,  # Explicitly handle 4.5
+        }
+        
+        # Find matching token limit
+        max_tokens = next(
+            (v for k, v in token_limits.items() if k in self.model),
+            8192  # Default fallback
+        )
+        
         try:
-            response = client.messages.create(
-                model=self.model,
-                system=self.system_prompt,
-                messages=[
+            # Build request parameters
+            request_params = {
+                "model": self.model,
+                "system": self.system_prompt,
+                "messages": [
                     {"role": "user", "content": self.prompt},
                 ],
-                temperature=self.temperature,
-                max_tokens=8192 if "claude-3-5-" in self.model else 4096,
-            )
-            assert isinstance(response.content[0], TextBlock)
+                "temperature": self.temperature,
+                "max_tokens": max_tokens,
+            }
+            
+            # Enable extended thinking for models that support it
+            # Currently: claude-sonnet-4.5, claude-opus-4.1, and claude-opus-4
+            if any(model_id in self.model for model_id in ['claude-sonnet-4.5', 'claude-opus-4']):
+                request_params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self.max_thinking_tokens if self.max_thinking_tokens else 10000  # Adjust based on your needs
+                }
+            
+            response = client.messages.create(**request_params)
+            
+            # Log token usage
             if response.usage is not None:
                 logger.info(
                     f"Token stats: {response.usage}; around {response.usage.output_tokens} completion tokens per completion"
                 )
+            
+            # Check for truncation
             if response.stop_reason == "max_tokens":
-                logger.warning(f"Completion was cut off due to length.")
-            return [response.content[0].text]
+                logger.warning("Completion was cut off due to length.")
+            
+            # Build merged output from content blocks in order
+            merged_output = ""
+            
+            for block in response.content:
+                if hasattr(block, 'type') and block.type == 'thinking':
+                    merged_output += f"<think>\n{block.thinking}\n</think>\n\n"
+                elif isinstance(block, TextBlock):
+                    merged_output += block.text
+            
+            return [merged_output.strip()]
+            
+        except Exception as e:
+            raise e
+
+    def prompt_vllm(self, logger: logging.Logger) -> list[str]:
+        """
+        Dispatches either to vLLM /v1/chat/completions or /v1/completions
+        depending on self.completions flag.
+        """
+        base_url = os.getenv("LOCAL_API_BASE", "http://127.0.0.1:8000").rstrip("/")
+        responses: list[str] = []
+
+        try:
+            # --- shared setup ---
+            extra_kwargs: dict[str, Any] = {}
+            if self.openai:
+                extra_kwargs["max_output_tokens"] = (
+                    Prompter.openai_max_completion_tokens[self.model]
+                )
+            else:
+                extra_kwargs["max_tokens"] = (
+                    8192
+                    if self.model not in Prompter.openai_together_context_lengths
+                    else Prompter.openai_together_context_lengths[self.model] - 2000
+                )
+
+            # messages always needed
+            messages: list[Any] = []
+            if "oss" in self.model:
+                messages.append({"role": "system", "content": f"Reasoning effort: {self.reasoning_effort}\n\n"})
+            if self.model.lower() in REASONING_EFFORT_MODELS:
+                messages.append({"role": "developer", "content": self.system_prompt})
+            elif self.model == "o1-mini":
+                pass
+            else:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": self.prompt})
+
+            headers = {"Content-Type": "application/json"}
+
+            # --------------------
+            # Case 1: Chat API
+            # --------------------
+            if self.local and not self.completions:
+                url = f"{base_url}/v1/chat/completions"
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": float(self.temperature),
+                    "max_tokens": extra_kwargs.get("max_tokens"),
+                    "stream": False,
+                }
+                # Optional stop tokens
+                if isinstance(getattr(self, "stop", None), (list, tuple)):
+                    payload["stop"] = list(self.stop)
+
+                r = requests.post(url, headers=headers, json=payload, timeout=1200)
+                r.raise_for_status()
+                data = r.json()
+
+                # vLLM chat format
+                content = ""
+                try:
+                    content = data["choices"][0]["message"].get("content", "") or ""
+                except Exception:
+                    content = data.get("choices", [{}])[0].get("text", "") or ""
+
+                responses.append(content)
+
+            # --------------------
+            # Case 2: Completions API
+            # --------------------
+            elif self.completions:
+                result = run_vllm_completions(
+                    base_url=base_url,
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=extra_kwargs.get("max_tokens"),
+                    reasoning_effort=str(self.reasoning_effort) if getattr(self, "reasoning_effort", None) else None,
+                    max_thinking_tokens=getattr(self, "max_thinking_tokens", 0),
+                    env=getattr(self, "env", None),
+                    scenario=getattr(self, "scenario", None),
+                    spec_type=getattr(self, "spec_type", None),
+                    safety_prompt=getattr(self, "safety_prompt", None),
+                    headers=headers,
+                    leave_think_open=True,   # only affects Qwen/DeepSeek (<think>)
+                )
+                responses.append(f"<think>{result['reasoning']}</think>{result["answer"]}")
+
+            return responses
+
         except Exception as e:
             raise e
 
@@ -1095,7 +1230,7 @@ Please complete this development task autonomously. Create all necessary files, 
                     "stream": False,
                     "options": options
                 }
-                r = requests.post(url, headers=headers, json=payload, timeout=600)
+                r = requests.post(url, headers=headers, json=payload, timeout=1200)
                 r.raise_for_status()
                 data = r.json()
                 content = data.get("message", {}).get("content", "") or data.get("response", "")
@@ -1107,32 +1242,65 @@ Please complete this development task autonomously. Create all necessary files, 
                 responses.append(merged)
 
             elif self.completions: 
-                # Convert messages to Qwen3 chat template format
-                def format_qwen3_prompt(messages):
-                    formatted_parts = []
-                    
-                    for message in messages:
-                        role = message.get("role", "")
-                        content = message.get("content", "")
-                        
-                        if role == "system":
-                            formatted_parts.append(f"<|im_start|>system\n{content}<|im_end|>")
-                        elif role == "user":
-                            formatted_parts.append(f"<|im_start|>user\n{content}<|im_end|>")
-                        elif role == "assistant":
-                            formatted_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
-                    
-                    # Add the assistant start token for generation
-                    formatted_parts.append("<|im_start|>assistant\n")
-                    
-                    return "\n".join(formatted_parts)
+                # Convert messages to GPT-OSS chat template format
+                def format_gpt_oss_prompt(
+                    messages,
+                    add_generation_prompt=True,
+                    analysis_trace: str | None = None,
+                ):
+                    """
+                    Format for GPT-OSS chat_template.
+                    - messages: list of {role: system|developer|user|assistant, content: str}
+                    - analysis_trace: if provided, inserts an assistant analysis block BEFORE final generation.
+                    Do NOT include sensitive chain-of-thought you intend to expose to users.
+                    """
+                    parts = []
+
+                    role_map = {
+                        "system": "system",
+                        "developer": "developer",
+                        "user": "user",
+                        "assistant": "assistant",
+                    }
+
+                    for i, m in enumerate(messages):
+                        role = m.get("role")
+                        content = m.get("content", "")
+                        if role not in role_map:
+                            continue
+
+                        if role == "assistant":
+                            # Past assistant turns are user-visible "final" messages
+                            parts.append(f"<|start|>assistant<|channel|>final<|message|>{content}<|end|>")
+                        elif role in ("system", "developer", "user"):
+                            parts.append(f"<|start|>{role_map[role]}<|message|>{content}<|end|>")
+
+                    # Optional hidden scratchpad / tool thoughts
+                    if analysis_trace:
+                        # Intentionally in the analysis channel (not user-facing)
+                        parts.append(f"<|start|>assistant<|channel|>analysis<|message|>{analysis_trace}<|end|>")
+
+                    # Hand control to the model to produce the user-facing reply
+                    if add_generation_prompt:
+                        parts.append("<|start|>assistant")
+
+                    return "".join(parts)
+
                 
                 # Call Ollama /api/generate for completions
                 url = f"{base_url}/api/generate"
                 headers = {"Content-Type": "application/json"}
                 
-                formatted_prompt = format_qwen3_prompt(messages)
+                with open('src/gpt_prompt.txt', 'r') as thinking_file:
+                    gpt_prompt = thinking_file.read().strip()
+
+                formatted_prompt = format_gpt_oss_prompt(messages, analysis_trace=gpt_prompt, add_generation_prompt=True)
                 
+                stop_tokens ={
+                  "gpt-oss:20b": ["<|end|>", "<|return|>"],  # Stop tokens for GPT_OSS
+                  "Qwen/Qwen3-32B": ["<|im_end|>", "<|endoftext|>"]  
+                } 
+
                 payload = {
                     "model": self.model,
                     "prompt": formatted_prompt,
@@ -1140,16 +1308,18 @@ Please complete this development task autonomously. Create all necessary files, 
                     "options": {
                         "temperature": float(self.temperature),
                         "num_predict": extra_kwargs.get("max_tokens"),
-                        "stop": ["<|im_end|>", "<|endoftext|>"]  # Stop tokens for Qwen3
+                        "stop": stop_tokens['gpt-oss:20b']
                     },
                 }
                 
-                r = requests.post(url, headers=headers, json=payload, timeout=600)
+                r = requests.post(url, headers=headers, json=payload, timeout=1200)
                 r.raise_for_status()
                 data = r.json()
                 
                 content = data.get("response", "")
-                responses.append(content)
+                thinking = gpt_prompt
+                merged = f"<think>{thinking}</think>{content}"
+                responses.append(merged)
 
             else:
                 # OpenAI / Together path unchanged
@@ -1187,6 +1357,8 @@ Please complete this development task autonomously. Create all necessary files, 
             return self.prompt_aider(logger)
         elif self.openrouter:
             return self.prompt_openrouter(logger)
+        elif self.vllm:
+            return self.prompt_vllm(logger)
         else:
             return self.prompt_openai_together_batch(logger)
 
@@ -1243,7 +1415,7 @@ class Parser:
         return [s.strip() for s in self.md_pattern.findall(response)]
 
     def _parse_code(self, response: str) -> list[str]:
-        response = response.split("</think>")[-1].split("--------------------")[0]
+        response = response.split("</think>")[-1]
         return [s.strip() for s in self.code_pattern.findall(response)]
 
     def _parse_aider_response(self, response: str) -> dict[pathlib.Path, str]:
