@@ -23,7 +23,7 @@ from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
 from scenarios.base import Scenario
 
 
-from completions_runner import run_vllm_completions
+from completions_runner import run_vllm_completions, run_ollama_completions
 
 _SYSTEM_PROMPT = "You are an experienced full-stack developer"
 
@@ -619,7 +619,10 @@ class Prompter:
         "aider": 128000,
         "gpt-oss:20b": 131072,
         "gpt-5-2025-08-07": 192000,
-        "Qwen/Qwen3-32B": 32768
+        "Qwen/Qwen3-32B": 32768,
+        "Qwen/Qwen3-8B": 32768,
+        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768
+        
     }
 
     openai_max_completion_tokens = {
@@ -631,7 +634,9 @@ class Prompter:
         "openhands": 32000,  # Generous limit for OpenHands output
         "aider": 32000,  # Generous limit for Aider output
         "gpt-5-2025-08-07": 128000,
-        "Qwen/Qwen3-32B": 16384
+        "Qwen/Qwen3-32B": 16384,
+        "Qwen/Qwen3-8B": 32768,
+        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768
     }
 
     openrouter_remap = {
@@ -651,15 +656,8 @@ class Prompter:
         safety_prompt: str,
         batch_size: int,
         temperature: float,
-        reasoning_effort: str,
-        max_thinking_tokens: str,
         openrouter: bool,
-        openhands_timeout: int = 300,  # OpenHands task timeout
-        openhands_max_iterations: int = 50,  # Max iterations for OpenHands
-        agent_port: Optional[int] = None,  # Port where OpenHands API server is running
-        container: Optional[Container] = None,  # Docker container for Aider
-        llm_model: Optional[str] = None,  # LLM model to use for agents that support it
-        vllm: bool = False
+        extra_args: Optional[dict[str, Any]] = None,
     ):
         self.env = env
         self.scenario = scenario
@@ -668,14 +666,18 @@ class Prompter:
         self.model = model
         self.batch_size = batch_size
         self.temperature = temperature
-        self.reasoning_effort = reasoning_effort
-        self.openhands_timeout = openhands_timeout
-        self.openhands_max_iterations = openhands_max_iterations
-        self.agent_port = agent_port
-        self.max_thinking_tokens = max_thinking_tokens
-
-        self.completions = True # set true for experimenting with reasoning
         
+        self.reasoning_effort = extra_args.reasoning_effort
+        self.openhands_timeout = extra_args.openhands_timeout
+        self.openhands_max_iterations = extra_args.openhands_max_iterations
+        self.agent_port = extra_args.agent_port
+        self.max_thinking_tokens = extra_args.max_thinking_tokens
+        self.vllm = extra_args.vllm
+        self.llm_model = extra_args.llm_model
+        self.completions = extra_args.completions # set true for experimenting with reasoning
+        self.trace_csv = extra_args.trace_csv
+        self.container = extra_args.container  # Docker container for Aider
+
         self.system_prompt = _SYSTEM_PROMPT
         self.o1_o3 = model.startswith("o1") or model.startswith("o3")
         self.anthropic = "claude" in model
@@ -683,16 +685,14 @@ class Prompter:
         self.openhands = model == "openhands"
         self.openrouter = openrouter and not (self.anthropic or self.openai or self.openhands)
         self.local = "oss" in model or not (self.anthropic or self.openai or self.openrouter or self.openhands)
-        print(f"Model={model} openrouter={self.openrouter} openai={self.openai} anthropic={self.anthropic} local={self.local} o1_o3={self.o1_o3} openhands={self.openhands}")
+        # print(f"Model={model} openrouter={self.openrouter} openai={self.openai} anthropic={self.anthropic} local={self.local} o1_o3={self.o1_o3} openhands={self.openhands}")
         self.aider = model == "aider"
-        self.vllm = vllm
 
-        self.llm_model = llm_model
         self.prompt = self.scenario.build_prompt(
             self.env, self.spec_type, self.safety_prompt
         )
 
-        self.container = container  # Docker container for Aider
+        
 
     def prompt_openhands(self, logger: logging.Logger) -> list[str]:
         """Execute task using OpenHands local runtime via docker-py"""
@@ -1078,6 +1078,7 @@ Please complete this development task autonomously. Create all necessary files, 
                     "temperature": float(self.temperature),
                     "max_tokens": extra_kwargs.get("max_tokens"),
                     "stream": False,
+                    # "repetition_penalty": 1.05,
                 }
                 # Optional stop tokens
                 if isinstance(getattr(self, "stop", None), (list, tuple)):
@@ -1113,9 +1114,10 @@ Please complete this development task autonomously. Create all necessary files, 
                     spec_type=getattr(self, "spec_type", None),
                     safety_prompt=getattr(self, "safety_prompt", None),
                     headers=headers,
-                    leave_think_open=True,   # only affects Qwen/DeepSeek (<think>)
+                    leave_think_open=False,   # only affects Qwen/DeepSeek (<think>)
+                    csv_path=self.trace_csv
                 )
-                responses.append(f"<think>{result['reasoning']}</think>{result["answer"]}")
+                responses.append(f"<think>{result['reasoning']}</think>{result['answer']}")
 
             return responses
 
@@ -1286,39 +1288,25 @@ Please complete this development task autonomously. Create all necessary files, 
 
                     return "".join(parts)
 
-                
-                # Call Ollama /api/generate for completions
-                url = f"{base_url}/api/generate"
                 headers = {"Content-Type": "application/json"}
                 
-                with open('src/gpt_prompt.txt', 'r') as thinking_file:
-                    gpt_prompt = thinking_file.read().strip()
+                results = run_ollama_completions(
+                    base_url=base_url,
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=extra_kwargs.get("max_tokens"),
+                    reasoning_effort=str(self.reasoning_effort) if getattr(self, "reasoning_effort", None) else None,
+                    max_thinking_tokens=getattr(self, "max_thinking_tokens", 0),
+                    env=getattr(self, "env", None),
+                    scenario=getattr(self, "scenario", None),
+                    spec_type=getattr(self, "spec_type", None),
+                    safety_prompt=getattr(self, "safety_prompt", None),
+                    headers=headers,
+                    leave_think_open=False,   # only affects Qwen/DeepSeek (<think>)
+                )
 
-                formatted_prompt = format_gpt_oss_prompt(messages, analysis_trace=gpt_prompt, add_generation_prompt=True)
-                
-                stop_tokens ={
-                  "gpt-oss:20b": ["<|end|>", "<|return|>"],  # Stop tokens for GPT_OSS
-                  "Qwen/Qwen3-32B": ["<|im_end|>", "<|endoftext|>"]  
-                } 
-
-                payload = {
-                    "model": self.model,
-                    "prompt": formatted_prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": float(self.temperature),
-                        "num_predict": extra_kwargs.get("max_tokens"),
-                        "stop": stop_tokens['gpt-oss:20b']
-                    },
-                }
-                
-                r = requests.post(url, headers=headers, json=payload, timeout=1200)
-                r.raise_for_status()
-                data = r.json()
-                
-                content = data.get("response", "")
-                thinking = gpt_prompt
-                merged = f"<think>{thinking}</think>{content}"
+                merged = f"<think>{results['reasoning']}</think>{results['answer']}"
                 responses.append(merged)
 
             else:

@@ -11,6 +11,22 @@ from print import tasks_and_results_to_table, tasks_and_results_to_table_average
 from scenarios import all_scenarios
 from scenarios.base import Scenario
 from tasks import Task, TaskHandler
+from dataclasses import dataclass
+from typing import Optional, Any
+
+@dataclass
+class ExtraArgs:
+    reasoning_effort: Optional[str] = None
+    max_thinking_tokens: Optional[int] = None
+    openhands_timeout: Optional[int] = 300
+    openhands_max_iterations: Optional[int] = 50
+    agent_port: Optional[int] = None
+    container: Optional[docker.models.containers.Container] = None
+    llm_model: Optional[str] = None
+    vllm: Optional[bool] = False
+    completions: Optional[bool] = False
+    trace_csv: Optional[str] = None
+
 
 def esc(text: str):
     return text.replace('/','-').replace('_','-')
@@ -61,6 +77,20 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
 
 def main(args: argparse.Namespace) -> None:
 
+    def parse_kv_pairs(pairs: Optional[list[str]]) -> dict[str, Any]:
+        if not pairs:
+            return {}
+        out = {}
+        for pair in pairs:
+            key, value = pair.split("=", 1)
+            try:
+                out[key] = eval(value)  # convert numbers, bools, etc.
+            except Exception:
+                out[key] = value
+        return out
+    
+    args.extra_args = parse_kv_pairs(args.extra_args)
+    args.extra_args = ExtraArgs(**args.extra_args)
     # ----- Run tasks -----#
     # Validate spec_type
     if "agent" in args.spec_type and args.models[0] not in ['aider','openhands','swe-agent']:
@@ -88,11 +118,8 @@ def main(args: argparse.Namespace) -> None:
                     temperature=args.temperature,
                     spec_type=args.spec_type,
                     safety_prompt=args.safety_prompt,
-                    reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
-                    llm_model=getattr(args, 'llm_model', None),
-                    max_thinking_tokens=args.max_thinking_tokens,
-                    vllm=args.vllm
+                    extra_args=args.extra_args,
                 )
                 for env in envs
                 for scenario in scenarios
@@ -136,11 +163,8 @@ def main(args: argparse.Namespace) -> None:
                     temperature=args.temperature,
                     spec_type=args.spec_type,
                     safety_prompt=args.safety_prompt,
-                    reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
-                    llm_model=getattr(args, 'llm_model', None),
-                    max_thinking_tokens=args.max_thinking_tokens,
-                    vllm=args.vllm
+                    extra_args=args.extra_args
                 )
                 for env in envs
                 for scenario in scenarios
@@ -181,11 +205,8 @@ def main(args: argparse.Namespace) -> None:
                     temperature=args.temperature,
                     spec_type=args.spec_type,
                     safety_prompt=args.safety_prompt,
-                    reasoning_effort=args.reasoning_effort,
                     openrouter=args.openrouter,
-                    llm_model=args.llm_model,
-                    max_thinking_tokens=args.max_thinking_tokens,
-                    vllm=args.vllm
+                    extra_args=args.extra_args
                 )
                 for env in envs
                 for scenario in scenarios
@@ -343,21 +364,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Route requests through OpenRouter",
     )
-    parser.add_argument(
-        "--llm_model",
-        type=str,
-        default=None,
-        help="LLM model to use for agents that support it (e.g., 'gpt-4o', 'gpt-5-mini-2025-08-07')",
-    )
-    parser.add_argument(
-        "--max_thinking_tokens",
-        type=int,
-        default=None, 
-        help="Maximum thinking budget for LLMs"
-    )
-    parser.add_argument(
-        "--vllm",
-        action="store_true",
-        help="Use VLLM for inferencing (for local models only)"
-    )
+    # parser.add_argument(
+    #     "--llm_model",
+    #     type=str,
+    #     default=None,
+    #     help="LLM model to use for agents that support it (e.g., 'gpt-4o', 'gpt-5-mini-2025-08-07')",
+    # )
+    # parser.add_argument(
+    #     "--max_thinking_tokens",
+    #     type=int,
+    #     default=None, 
+    #     help="Maximum thinking budget for LLMs"
+    # )
+    # parser.add_argument(
+    #     "--vllm",
+    #     action="store_true",
+    #     help="Use VLLM for inferencing (for local models only)"
+    # )
+    parser.add_argument("--extra_args", nargs="*", default={}, type=str,
+                    help='Extra args like key=value pairs')
+
+
     main(parser.parse_args())

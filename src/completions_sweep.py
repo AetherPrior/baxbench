@@ -55,6 +55,8 @@ def load_unique_combos(csv_path: str) -> pd.DataFrame:
         raise FileNotFoundError(f"CSV not found: {csv_path}")
     sep = infer_sep(csv_path)
     df = pd.read_csv(csv_path, sep=sep)
+    df = df[df['passed'] == True]
+
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"CSV missing required columns: {missing}")
@@ -64,6 +66,7 @@ def load_unique_combos(csv_path: str) -> pd.DataFrame:
         df[col] = df[col].astype(str).str.strip()
 
     uniq = df.drop_duplicates(subset=REQUIRED_COLS).reset_index(drop=True)
+    # filter out CWEs that havent passed 
     return uniq
 
 

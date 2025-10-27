@@ -106,13 +106,10 @@ class Task:
     scenario: Scenario
     model: str
     temperature: float
-    reasoning_effort: str
-    max_thinking_tokens: int
     spec_type: str
     safety_prompt: str
     openrouter: bool
-    llm_model: Optional[str]
-    vllm: Optional[bool] = False
+    extra_args: Optional[dict[str, Any]] = None
 
     @property
     def id(self) -> str:
@@ -137,10 +134,10 @@ class Task:
 
     def get_save_dir(self, results_dir: pathlib.Path) -> pathlib.Path:
         model_reasoning = esc(self.model) 
-        if self.reasoning_effort and self.model.lower() in REASONING_EFFORT_MODELS:
-            model_reasoning += f"-{esc(self.reasoning_effort)}"
+        if self.extra_args.reasoning_effort and self.model.lower() in REASONING_EFFORT_MODELS:
+            model_reasoning += f"-{esc(self.extra_args.reasoning_effort)}"
         elif self.model.lower() in REASONING_TOKENS_MODELS: # TODO CHANGE
-            model_reasoning += f"-{esc(str(self.max_thinking_tokens))}"
+            model_reasoning += f"-{esc(str(self.extra_args.max_thinking_tokens))}"
         save_dir = (
             results_dir
             / model_reasoning
@@ -277,8 +274,8 @@ class Task:
                 batch_size,
                 self.temperature,
                 self.id,
-                self.reasoning_effort,
-                self.max_thinking_tokens
+                self.extra_args.reasoning_effort,
+                self.extra_args.max_thinking_tokens
             )
 
             prompter = Prompter(
@@ -289,10 +286,8 @@ class Task:
                 safety_prompt=self.safety_prompt,
                 batch_size=batch_size,
                 temperature=self.temperature,
-                reasoning_effort=self.reasoning_effort,
-                max_thinking_tokens=self.max_thinking_tokens,
                 openrouter=openrouter,
-                vllm=self.vllm
+                extra_args=self.extra_args,
             )
             logger.info("built prompt:\n%s", prompter.prompt)
             logger.info("-" * 100)

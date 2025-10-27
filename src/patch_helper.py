@@ -104,7 +104,7 @@ def format_gpt_oss_manual(
         parts.append(_gptoss_render_assistant_analysis(analysis_trace))
 
     if leave_think_open:
-        parts[-1].strip("<|end|>")
+        parts[-1] = parts[-1].strip("<|end|>")
 
     # Finally open the assistant for generation
     if add_generation_prompt:
@@ -123,8 +123,8 @@ def format_qwen_manual(
 ) -> str:
     parts = _format_common_preamble(messages, keep_developer=False)
     assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open)
-    return "\n".join(parts + [assistant_prefix]) if add_generation_prompt \
-           else "\n".join(parts + [assistant_prefix + "<|im_end|>"])
+    return "\n".join(parts + [assistant_prefix + "<|im_end|>"]) if add_generation_prompt \
+           else "\n".join(parts + [assistant_prefix])
 
 # =========================
 # Deepseek-distilled-Qwen (manual, <think> style)
@@ -132,13 +132,13 @@ def format_qwen_manual(
 def format_deepseek_qwen_manual(
     messages: List[Dict[str, str]],
     analysis_trace: Optional[str] = None,
-    add_generation_prompt: bool = True,
+    add_generation_prompt: bool = False,
     leave_think_open: bool = True,
 ) -> str:
     parts = _format_common_preamble(messages, keep_developer=False)
     assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open)
-    return "\n".join(parts + [assistant_prefix]) if add_generation_prompt \
-           else "\n".join(parts + [assistant_prefix + "<|im_end|>"])
+    return "\n".join(parts + [assistant_prefix + "<|im_end|>"]) if add_generation_prompt \
+           else "\n".join(parts + [assistant_prefix])
 
 # =========================
 # Dispatcher + stops
@@ -223,6 +223,7 @@ def load_reasoning_trace_for_instance(
     model: str,
     max_thinking_tokens: str,
     filters: Dict[str, Any],
+    csv_path: str,
     first_fix: bool=True,
 ) -> Optional[str]:
 
@@ -231,12 +232,8 @@ def load_reasoning_trace_for_instance(
     else:
         max_thinking_tokens = str(max_thinking_tokens)
   
-    def esc(text):
-        return re.sub(r"/|:|_", '-', text)
-    
-    base_dir = f"collated_outputs/{esc(model)}-{max_thinking_tokens}_cwes"
-    csv_path = os.path.join(base_dir, f"{esc(model)}-{max_thinking_tokens}_instances_rewrites.csv")
     if not os.path.isfile(csv_path):
+        breakpoint()
         return None
 
     df = None
@@ -252,13 +249,13 @@ def load_reasoning_trace_for_instance(
     for key in ("env", "scenario", "spec_type", "safety_prompt"):
         val = filters.get(key)
         if key == "env":
-            val = f"{val.language}-{val.framework}"
+            val = f"{val.language}{val.framework}" # check
         elif key == "scenario":
             val = val.id
         if val is not None and key in df.columns:
             df = df[df[key] == val]
 
-    target_col = 'first_fix' if first_fix else 'full_fix'
+    target_col = 'new_trace' # if first_fix else 'full_fix'
     if df.empty or target_col not in df.columns:
         return None
 
@@ -267,4 +264,19 @@ def load_reasoning_trace_for_instance(
         return None
 
     trace = str(series.iloc[0]).strip()
+    
+    # if "NO AMBIGUITY" in trace:
+    #     target_col = 'reasoning_trace'
+    #     if target_col not in df.columns:
+    #         return None
+    #     series = df[target_col].dropna()
+    #     if series.empty:
+    #         return None
+        
+    #     trace = str(series.iloc[0]).strip()
+    
+    # strip [start trace] and [end trace] if present
+    trace = re.sub(r"^\[start trace\]", "", trace, flags=re.IGNORECASE).strip()
+    trace = re.sub(r"\[end trace\]$", "", trace, flags=re.IGNORECASE).strip()
+    # breakpoint()
     return trace or None
