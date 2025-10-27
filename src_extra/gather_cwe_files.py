@@ -425,6 +425,14 @@ Example usage:
         default='.',
         help='Root directory containing the model results (default: current directory)'
     )
+
+    parser.add_argument(
+        '--target-dir',
+        default='.',
+        help='Base directory where organized folders will be created (default: current directory)'
+    )
+    # The final organized folders will be created under
+    # {target-dir}/{escaped_model_name}_{target_suffix} (e.g. ./results/gpt-oss-20b_cwes)
     
     # parser.add_argument(
     #     '--target-suffix',
@@ -481,9 +489,14 @@ def organize_cwe_logs_main(args):
         if args.verbose:
             print(f"Processing model: {model_name}")
         
-        # Create target directory for outputs
+        # Create base target directory for outputs (using provided --target-dir)
         target_suffix = 'cwes'
-        target_dir = Path(f"{model_name}_{target_suffix}")
+        base_target_dir = Path(args.target_dir)
+        # Ensure base exists
+        if not args.dry_run:
+            base_target_dir.mkdir(parents=True, exist_ok=True)
+        # Top-level directory used for plots and general outputs
+        target_dir = base_target_dir / f"{model_name}_{target_suffix}"
         if not args.dry_run:
             target_dir.mkdir(exist_ok=True)
         
@@ -515,15 +528,15 @@ def organize_cwe_logs_main(args):
             return
         
         print(f"{'Would create' if args.dry_run else 'Created/using'} directory: {target_dir}")
-        
+
         def process_scenarios(scenarios, target_suffix):
             copied_count = 0
             missing_files = []
 
-            # ensure the directory exists for this bucket
-            target_dir = Path(f'{esc_model_name(model_name)}_{target_suffix}')
+            # ensure the directory exists for this bucket under the provided base target dir
+            bucket_dir = base_target_dir / f"{esc_model_name(model_name)}_{target_suffix}"
             if not args.dry_run:
-                target_dir.mkdir(parents=True, exist_ok=True)
+                bucket_dir.mkdir(parents=True, exist_ok=True)
 
             for scenario_info in scenarios:
                 if args.verbose or args.dry_run:
@@ -532,7 +545,7 @@ def organize_cwe_logs_main(args):
                 source_paths = construct_source_paths(args.source_dir, scenario_info, args.temperature, model_name)
 
                 gen_source = source_paths['gen_log']
-                gen_target = target_dir / construct_target_filename(scenario_info, 'gen', args.temperature)
+                gen_target = bucket_dir / construct_target_filename(scenario_info, 'gen', args.temperature)
 
                 if gen_source.exists():
                     if args.dry_run:
@@ -548,7 +561,7 @@ def organize_cwe_logs_main(args):
                         print(f"  ✗ Missing: {gen_source}")
 
                 test_source = source_paths['test_log']
-                test_target = target_dir / construct_target_filename(scenario_info, 'test', args.temperature)
+                test_target = bucket_dir / construct_target_filename(scenario_info, 'test', args.temperature)
 
                 if test_source.exists():
                     if args.dry_run:
@@ -574,7 +587,7 @@ def organize_cwe_logs_main(args):
                     print(f"  - {m}")
 
             if not args.dry_run:
-                print(f"\nOrganized logs in: {target_dir.absolute()}")
+                print(f"\nOrganized logs in: {bucket_dir.absolute()}")
 
         process_scenarios(cwe_scenarios, target_suffix='cwes')
         process_scenarios(non_cwe_scenarios, target_suffix='sec')
