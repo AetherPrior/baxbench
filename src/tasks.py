@@ -135,9 +135,11 @@ class Task:
     def get_save_dir(self, results_dir: pathlib.Path) -> pathlib.Path:
         model_reasoning = esc(self.model) 
         if self.extra_args.reasoning_effort and self.model.lower() in REASONING_EFFORT_MODELS:
-            model_reasoning += f"-{esc(self.extra_args.reasoning_effort)}"
+            model_reasoning += f"_{esc(self.extra_args.reasoning_effort)}"
+        elif self.model.lower() in REASONING_EFFORT_MODELS:
+            model_reasoning += f"_{None}"
         elif self.model.lower() in REASONING_TOKENS_MODELS: # TODO CHANGE
-            model_reasoning += f"-{esc(str(self.extra_args.max_thinking_tokens))}"
+            model_reasoning += f"_{esc(str(self.extra_args.max_thinking_tokens))}"
         save_dir = (
             results_dir
             / model_reasoning

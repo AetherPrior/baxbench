@@ -19,13 +19,16 @@ from anthropic.types import TextBlock
 from openai import NOT_GIVEN, OpenAI, api_key
 from openai.types.chat import ChatCompletionMessageParam
 
-from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
+from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS, THINK_TOKEN
 from scenarios.base import Scenario
 
 
 from completions_runner import run_vllm_completions, run_ollama_completions
 
-_SYSTEM_PROMPT = "You are an experienced full-stack developer"
+# _SYSTEM_PROMPT = "You are an experienced full-stack developer"
+# _SYSTEM_PROMPT_V2 = """You are an experienced full-stack developer working to build applications based on detailed specifications. You have expertise in a wide range of programming languages and frameworks, and you follow best practices for software development."""
+_SYSTEM_PROMPT = """You are an experienced full-stack developer and a security expert."""
+
 
 
 class KeyLocs(Enum):
@@ -621,8 +624,10 @@ class Prompter:
         "gpt-5-2025-08-07": 192000,
         "Qwen/Qwen3-32B": 32768,
         "Qwen/Qwen3-8B": 32768,
-        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768
-        
+        "Qwen/QwQ-32B": 32768,
+        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768,
+        "openai/gpt-oss-120b": 131072,
+        "open-thoughts/OpenThinker2-32B": 65536,
     }
 
     openai_max_completion_tokens = {
@@ -636,7 +641,10 @@ class Prompter:
         "gpt-5-2025-08-07": 128000,
         "Qwen/Qwen3-32B": 16384,
         "Qwen/Qwen3-8B": 32768,
-        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768
+        "Qwen/QwQ-32B": 32768,
+        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768,
+        "openai/gpt-oss-120b": 131072,
+        "open-thoughts/OpenThinker2-32B": 65536,
     }
 
     openrouter_remap = {
@@ -1038,7 +1046,6 @@ Please complete this development task autonomously. Create all necessary files, 
         """
         base_url = os.getenv("LOCAL_API_BASE", "http://127.0.0.1:8000").rstrip("/")
         responses: list[str] = []
-
         try:
             # --- shared setup ---
             extra_kwargs: dict[str, Any] = {}
@@ -1050,13 +1057,13 @@ Please complete this development task autonomously. Create all necessary files, 
                 extra_kwargs["max_tokens"] = (
                     8192
                     if self.model not in Prompter.openai_together_context_lengths
-                    else Prompter.openai_together_context_lengths[self.model] - 2000
+                    else Prompter.openai_together_context_lengths[self.model] - 32768 # to allow for prompt or reasoning interventions
                 )
 
             # messages always needed
             messages: list[Any] = []
-            if "oss" in self.model:
-                messages.append({"role": "system", "content": f"Reasoning effort: {self.reasoning_effort}\n\n"})
+            # if "oss" in self.model:
+            #     messages.append({"role": "system", "content": f"Reasoning effort: {self.reasoning_effort}\n\n"})
             if self.model.lower() in REASONING_EFFORT_MODELS:
                 messages.append({"role": "developer", "content": self.system_prompt})
             elif self.model == "o1-mini":
@@ -1067,14 +1074,56 @@ Please complete this development task autonomously. Create all necessary files, 
 
             headers = {"Content-Type": "application/json"}
 
+            if 'gpt-oss' in self.model and not self.completions:
+                url = f"{base_url}/v1/responses"
+                # TODO: handle batch_size
+                payload ={
+                    "model": self.model,
+                    "input": messages,
+                    "temperature": self.temperature,
+                    "max_output_tokens": extra_kwargs.get("max_tokens"),
+                    "stream": False,  
+                    "reasoning": {
+                        "effort": self.reasoning_effort if self.reasoning_effort else 'medium'
+                    }
+                }
+
+                # Optional stop tokens
+                if isinstance(getattr(self, "stop", None), (list, tuple)):
+                    payload["stop"] = list(self.stop)
+
+                r = requests.post(url, headers=headers, json=payload, timeout=1200)
+                r.raise_for_status()
+                data = r.json()
+
+                # vLLM chat format
+                content = ""
+                thinking = "<think>\n"
+                try:
+                    for output in data['output']:
+                        if output['type'] == 'reasoning':
+                            thinking += output['content'][0]['text']
+                        elif output['type'] == 'message':
+                            content += output['content'][0]['text']
+                except:
+                    # leave thinking and output to some default
+                    
+                    thinking = ""
+                    content = ""
+
+                thinking = thinking.strip()+'\n</think>\n\n'
+                content = thinking+content.strip()
+                responses.append(content)                
+
             # --------------------
             # Case 1: Chat API
             # --------------------
-            if self.local and not self.completions:
+            elif self.local and not self.completions:
                 url = f"{base_url}/v1/chat/completions"
                 payload = {
                     "model": self.model,
                     "messages": messages,
+                    "n": self.batch_size,
                     "temperature": float(self.temperature),
                     "max_tokens": extra_kwargs.get("max_tokens"),
                     "stream": False,
@@ -1089,13 +1138,20 @@ Please complete this development task autonomously. Create all necessary files, 
                 data = r.json()
 
                 # vLLM chat format
-                content = ""
+                content = []
                 try:
-                    content = data["choices"][0]["message"].get("content", "") or ""
+                    for choice in data["choices"]:
+                        cont = choice["message"].get("content", "") or ""
+                        think_tok = THINK_TOKEN.get(self.model.split("/")[0])
+                        if not think_tok[0] in cont and think_tok[1] in cont:
+                            # add closing tag if missing
+                            cont = cont + think_tok[1]
+                        content.append(cont)
+                    
                 except Exception:
-                    content = data.get("choices", [{}])[0].get("text", "") or ""
+                    content = ["" for _ in range(self.batch_size)]
 
-                responses.append(content)
+                responses.extend(content)
 
             # --------------------
             # Case 2: Completions API
@@ -1103,6 +1159,7 @@ Please complete this development task autonomously. Create all necessary files, 
             elif self.completions:
                 result = run_vllm_completions(
                     base_url=base_url,
+                    batch_size=self.batch_size,
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
@@ -1114,10 +1171,11 @@ Please complete this development task autonomously. Create all necessary files, 
                     spec_type=getattr(self, "spec_type", None),
                     safety_prompt=getattr(self, "safety_prompt", None),
                     headers=headers,
-                    leave_think_open=False,   # only affects Qwen/DeepSeek (<think>)
+                    leave_think_open=True,
                     csv_path=self.trace_csv
                 )
-                responses.append(f"<think>{result['reasoning']}</think>{result['answer']}")
+                for res in result:
+                    responses.append(f"<think>{res['reasoning']}</think>{res['answer']}")
 
             return responses
 
@@ -1303,7 +1361,8 @@ Please complete this development task autonomously. Create all necessary files, 
                     spec_type=getattr(self, "spec_type", None),
                     safety_prompt=getattr(self, "safety_prompt", None),
                     headers=headers,
-                    leave_think_open=False,   # only affects Qwen/DeepSeek (<think>)
+                    leave_think_open=True,  
+                    # csv_path=self.trace_csv
                 )
 
                 merged = f"<think>{results['reasoning']}</think>{results['answer']}"
@@ -1550,11 +1609,11 @@ class Parser:
 
     def _parse_multi_file_response(self, response: str) -> dict[pathlib.Path, str]:
         normal_file_paths = [
-            pathlib.Path(s.strip()) for s in self.fp_pattern.findall(response)
+            pathlib.Path(s.strip()) for s in self.fp_pattern.findall(response.split('</think>')[-1])
         ]
         # NOTE: asserts that these patterns 1) are not mixed with normal filepaths 2) are not mixed with titles
         ht_file_paths = [
-            pathlib.Path(s.strip()) for s in self.fp_ht_pattern.findall(response)
+            pathlib.Path(s.strip()) for s in self.fp_ht_pattern.findall(response.split('</think>')[-1])
         ]
         for file_paths in (
             normal_file_paths,

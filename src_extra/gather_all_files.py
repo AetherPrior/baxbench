@@ -30,9 +30,19 @@ import re
 
 def extract_model_name(json_filename: str) -> str:
     """Extract model name from JSON filename."""
-    if json_filename.startswith("overall_results_"):
-        return json_filename[len("overall_results_"):-5]  # Remove prefix and .json
-    return json_filename[:-5]  # Just remove .json
+    # if json_filename.startswith("overall_results_"):
+    #     return json_filename[len("overall_results_"):-5]  # Remove prefix and .json
+    # split by _ and remove temp/spec/safety/reasoning parts
+    json_filename = json_filename.replace("overall_results_", "")
+    parts = json_filename[:-5].split('_')  # Remove .json
+    if len(parts) <= 1:
+        return json_filename[:-5]
+    # assume last 4 parts are temp, spec_type, safety_prompt, reasoning_effort
+    temp, spec_type, safety_prompt, reasoning_effort = parts[-4:]
+    model_name = parts[0]
+    if len(parts) > 5:
+        model_name = '_'.join(parts[:-4])
+    return model_name
 
 
 def parse_environment_config(env_key: str) -> Dict[str, str]:
@@ -68,7 +78,7 @@ def collect_all_scenarios(data: Dict, model: str) -> List[Dict]:
     return scenarios
 
 
-def construct_source_paths(base_dir: str, scenario_info: Dict, temperature: str, model: str) -> Dict[str, Path]:
+def construct_source_paths(base_dir: str, scenario_info: Dict, temperature: str, model: str, reasoning_suffix: str) -> Dict[str, Path]:
     """Construct source file paths based on the folder structure."""
     scenario = scenario_info['scenario']
     env_id = scenario_info['env_id']
@@ -77,7 +87,7 @@ def construct_source_paths(base_dir: str, scenario_info: Dict, temperature: str,
     temp_str = temperature  # keep exact string
 
     folder_name = f"temp{temp_str}-{spec_type}-{safety_prompt}"
-    scenario_dir = Path(base_dir) / model / scenario / env_id / folder_name
+    scenario_dir = Path(base_dir) / f"{model}_{reasoning_suffix}" / scenario / env_id / folder_name
 
     return {
         'gen_log': scenario_dir / "gen.log",
@@ -306,6 +316,7 @@ Examples:
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('--plot', action='store_true', help='Generate plots for model evaluation results')
     parser.add_argument('--plot-only', action='store_true', help='Only generate plots without organizing logs')
+    parser.add_argument('--reasoning-suffix', default='None', help='Reasoning effort/token suffix used in filenames (default: None)')
     return parser.parse_args()
 
 
@@ -325,6 +336,7 @@ def organize_all_logs(args):
             data = json.load(f)
 
         model_name = extract_model_name(os.path.basename(args.json_file))
+
         if args.verbose:
             print(f"Processing model: {model_name}")
 
@@ -333,7 +345,7 @@ def organize_all_logs(args):
             base_target_dir.mkdir(parents=True, exist_ok=True)
 
         # Folder for plots and overall outputs
-        plots_dir = base_target_dir / f"{model_name}_collated"
+        plots_dir = base_target_dir / f"{esc_model_name(model_name)}_{args.reasoning_suffix}_collated"
         if not args.dry_run:
             plots_dir.mkdir(exist_ok=True)
 
@@ -355,7 +367,7 @@ def organize_all_logs(args):
             return
 
         # Single collated bucket
-        bucket_dir = base_target_dir / f"{esc_model_name(model_name)}_collated"
+        bucket_dir = base_target_dir / f"{esc_model_name(model_name)}_{args.reasoning_suffix}_collated"
         if not args.dry_run:
             bucket_dir.mkdir(parents=True, exist_ok=True)
         print(f"{'Would use' if args.dry_run else 'Using'} directory: {bucket_dir}")
@@ -369,7 +381,7 @@ def organize_all_logs(args):
             if args.verbose or args.dry_run:
                 print(f"\nProcessing {scenario_info.get('scenario','<unknown>')} ({scenario_info.get('env_id','?')})")
 
-            paths = construct_source_paths(args.source_dir, scenario_info, args.temperature, model_name)
+            paths = construct_source_paths(args.source_dir, scenario_info, args.temperature, model_name, args.reasoning_suffix)
 
             # gen.log
             gen_source = paths['gen_log']

@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Any, Tuple
 import re
 import pandas as pd
 import os
+from env.base import THINK_TOKEN
 
 _ALLOWED_ROLES = {"system", "user", "assistant", "developer"}
 
@@ -28,13 +29,13 @@ def _format_common_preamble(messages: List[Dict[str, str]], keep_developer: bool
         parts.append(_block(role, content))
     return parts
 
-def _assistant_prefix_with_trace(trace: Optional[str], leave_think_open: bool) -> str:
+def _assistant_prefix_with_trace(trace: Optional[str], leave_think_open: bool, model_str: str) -> str:
     prefix = "<|im_start|>assistant\n"
     if trace:
         if leave_think_open:
-            prefix += f"<think>{trace}"
+            prefix += f"{THINK_TOKEN[model_str][0]}{trace}"
         else:
-            prefix += f"<think>{trace}</think>\n"
+            prefix += f"{THINK_TOKEN[model_str][0]}{trace}{THINK_TOKEN[model_str][1]}\n"
     return prefix
 
 # =========================
@@ -61,7 +62,7 @@ def _gptoss_render_assistant_analysis(content: str) -> str:
 
 def _gptoss_generation_open() -> str:
     # Open an assistant turn; model should emit <|channel|>final<|message|>... as it completes
-    return "<|start|>assistant"
+    return "<|start|>assistant<|channel|>final<|message|>"
 
 def _extract_dev_and_rest(messages: List[Dict[str, str]]) -> Tuple[Optional[str], List[Dict[str, str]]]:
     if messages and messages[0].get("role") in {"developer", "system"}:
@@ -122,7 +123,8 @@ def format_qwen_manual(
     leave_think_open: bool = True,
 ) -> str:
     parts = _format_common_preamble(messages, keep_developer=False)
-    assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open)
+    model_str = 'qwen'
+    assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open, model_str)
     return "\n".join(parts + [assistant_prefix + "<|im_end|>"]) if add_generation_prompt \
            else "\n".join(parts + [assistant_prefix])
 
@@ -136,8 +138,21 @@ def format_deepseek_qwen_manual(
     leave_think_open: bool = True,
 ) -> str:
     parts = _format_common_preamble(messages, keep_developer=False)
-    assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open)
+    model_str = 'deepseek-ai'
+    assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open, model_str)
     return "\n".join(parts + [assistant_prefix + "<|im_end|>"]) if add_generation_prompt \
+           else "\n".join(parts + [assistant_prefix])
+
+def format_open_thoughts_manual(
+    messages: List[Dict[str, str]],
+    analysis_trace: Optional[str] = None,
+    add_generation_prompt: bool = True,
+    leave_think_open: bool = True,
+) -> str:
+    parts = _format_common_preamble(messages, keep_developer=True)
+    model_str = 'open-thoughts'
+    assistant_prefix = _assistant_prefix_with_trace(analysis_trace, leave_think_open, model_str)
+    return "\n".join(parts + [assistant_prefix + "<|end_of_thought|>\n\n<|begin_of_solution|>"]) if add_generation_prompt \
            else "\n".join(parts + [assistant_prefix])
 
 # =========================
@@ -151,6 +166,8 @@ def select_manual_formatter(model_name: str):
         return "deepseek-qwen", format_deepseek_qwen_manual
     if "qwen" in m:
         return "qwen", format_qwen_manual
+    if 'open-thoughts' in m:
+        return "open-thoughts", format_open_thoughts_manual
     return "qwen", format_qwen_manual
 
 def default_stop_tokens(model_family: str):
@@ -192,10 +209,13 @@ def split_reasoning_and_answer(
 
     # 1) GPT-OSS split
     final_tag = "<|channel|>final<|message|>"
-    if final_tag in text:
-        idx = text.find(final_tag)
+    vllm_final_tag = "assistantfinal"
+
+    if final_tag in text or vllm_final_tag in text:
+        tag_to_find = final_tag if final_tag in text else vllm_final_tag
+        idx = text.find(tag_to_find)
         pre = text[:idx]
-        post = text[idx + len(final_tag):]
+        post = text[idx + len(tag_to_find):]
         # Coalesce any continued analysis (if you ever left a GPT-OSS analysis open—uncommon)
         reasoning = (injected + pre).strip()
         # Trim trailing GPT-OSS end token if present
@@ -227,10 +247,10 @@ def load_reasoning_trace_for_instance(
     first_fix: bool=True,
 ) -> Optional[str]:
 
-    if not max_thinking_tokens:
-        max_thinking_tokens = "None"
-    else:
-        max_thinking_tokens = str(max_thinking_tokens)
+    # if not max_thinking_tokens:
+    #     max_thinking_tokens = "None"
+    # else:
+    #     max_thinking_tokens = str(max_thinking_tokens)
   
     if not os.path.isfile(csv_path):
         breakpoint()

@@ -10,7 +10,9 @@ from patch_helper import (
     load_reasoning_trace_for_instance
 )
 
-from env.base import REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS
+from thinking_budget_enforcer import run_vllm_enforced_completions
+
+from env.base import REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS, THINK_TOKEN
 
 class CompletionsResult(TypedDict):
     prompt: str                 # full prompt sent to vLLM (for logging/debug)
@@ -25,6 +27,7 @@ def run_vllm_completions(
     *,
     base_url: str,
     model: str,
+    batch_size: int,
     messages: List[Dict[str, str]],
     temperature: float,
     max_tokens: Optional[int],
@@ -36,7 +39,7 @@ def run_vllm_completions(
     spec_type: Optional[str] = None,
     safety_prompt: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
-    leave_think_open: bool = False,   # applies to Qwen/DeepSeek (<think> path). GPT-OSS ignores this.
+    leave_think_open: bool = False,   
     timeout: int = 1200,
 ) -> CompletionsResult:
     """
@@ -50,6 +53,28 @@ def run_vllm_completions(
         * GPT-OSS: splits at '<|channel|>final<|message|>' (answer after it, before optional '<|end|>').
         * Qwen/DeepSeek: splits at '</think>'; if none, all generation is reasoning.
     """
+
+    if max_thinking_tokens is not None and max_thinking_tokens > 0:
+        return run_vllm_enforced_completions(
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            batch_size=batch_size,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            csv_path=csv_path,
+            reasoning_effort=reasoning_effort,
+            max_thinking_tokens=max_thinking_tokens,
+            env=env,
+            scenario=scenario,
+            spec_type=spec_type,
+            safety_prompt=safety_prompt,
+            headers=headers,
+            leave_think_open=leave_think_open,
+            timeout=timeout,
+            thinking_budget_max_retries=3
+        )
+
     # 1) Trace lookup (CSV -> file -> None)
     analysis_trace: Optional[str] = None
     try:
@@ -68,10 +93,6 @@ def run_vllm_completions(
     except Exception:
         analysis_trace = None
 
-    # Optional: budget injected trace length (simple character budget;
-    # replace with token-based logic if you prefer)
-    if analysis_trace and max_thinking_tokens and max_thinking_tokens > 0:
-        analysis_trace = analysis_trace[:max_thinking_tokens]
 
     # 2) Manual formatting per model family
     family, formatter = select_manual_formatter(model)
@@ -105,32 +126,47 @@ def run_vllm_completions(
         "max_tokens": max_tokens,
         "stream": False,
         "stop": stop_list,
+        "n": batch_size,
     }
     # prune Nones
     payload = {k: v for k, v in payload.items() if v is not None}
-
+    # breakpoint()
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
 
     # 4) Extract raw completion text
-    raw = ""
+    raw = []
     try:
-        raw = data["choices"][0].get("text", "") or ""
+        for data in data["choices"]:
+            raw.append(data.get("text", "") or "")
     except Exception:
-        raw = ""
+        raw = []
 
     # 5) Split into reasoning vs answer (handles GPT-OSS channels and Qwen/DeepSeek </think>)
-    reasoning, answer = split_reasoning_and_answer(analysis_trace, raw)
+    reasoning = []
+    answer = []
+    for raw_text in raw:
+        r, a = split_reasoning_and_answer(analysis_trace, raw_text)
+        reasoning.append(r)
+        answer.append(a)
     # breakpoint()
-    return {
+    # return {
+    #     "prompt": formatted_prompt,
+    #     "raw": raw,
+    #     "reasoning": reasoning,
+    #     "answer": answer,
+    #     "model_family": family,
+    #     "stop": stop_list,
+    # }
+    return [{
         "prompt": formatted_prompt,
-        "raw": raw,
-        "reasoning": reasoning,
-        "answer": answer,
+        "raw": raw[i],
+        "reasoning": reasoning[i],
+        "answer": answer[i],
         "model_family": family,
         "stop": stop_list,
-    }
+    } for i in range(len(raw))]
 
 def run_ollama_completions(
     *,

@@ -91,6 +91,11 @@ def main(args: argparse.Namespace) -> None:
     
     args.extra_args = parse_kv_pairs(args.extra_args)
     args.extra_args = ExtraArgs(**args.extra_args)
+
+    # print all args
+    print("Running with args:")
+    for arg, val in vars(args).items():
+        print(f"  {arg}: {val}")
     # ----- Run tasks -----#
     # Validate spec_type
     if "agent" in args.spec_type and args.models[0] not in ['aider','openhands','swe-agent']:
@@ -227,8 +232,9 @@ def main(args: argparse.Namespace) -> None:
         print(tasks_and_results_to_table_averages(r))
         print()
         print(tasks_and_results_to_table(r, verbose=False))
+        reasoning_effort = args.extra_args.reasoning_effort if args.extra_args.reasoning_effort else "None"
         save_results_as_json(r, 
-                             filename=pathlib.Path(args.results_dir, f"overall_results_{esc(args.models[0])}_{args.reasoning_effort}.json"), 
+                             filename=pathlib.Path(args.results_dir, f"overall_results_{esc(args.models[0])}_{args.temperature}_{args.spec_type}_{args.safety_prompt}_{reasoning_effort}.json"), 
                              include_samples=True,
                              verbose=True)
     else:
