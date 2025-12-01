@@ -226,5 +226,5 @@ THINK_TOKEN = {
     'open-thoughts': ['<|begin_of_thought|>', '<|end_of_thought|>\n\n<|begin_of_solution|>'],
 }
 
-REASONING_EFFORT_MODELS = ["o1", "o3", "gpt-oss:20b", "gpt-oss:120b", "gpt-5-2025-08-07", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+REASONING_EFFORT_MODELS = ["o1", "o3", "gpt-oss:20b", "gpt-oss:120b", "gpt-5-2025-08-07", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "gpt-5-mini"]
 REASONING_TOKENS_MODELS = ['qwen3:32b', 'claude-4-sonnet','qwen/qwen3-32b', 'qwen/qwen3-8b', 'deepseek-ai/deepseek-r1-0528-qwen3-8b', 'deepseek-ai-DeepSeek-R1-0528-Qwen3-32b', 'Qwen/QwQ-32B', 'open-thoughts/OpenThinker2-32B']

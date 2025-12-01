@@ -13,11 +13,12 @@ from venv import logger
 from docker.models.containers import Container
 import docker
 import requests
-
+import asyncio
 from anthropic import Anthropic
 from anthropic.types import TextBlock
 from openai import NOT_GIVEN, OpenAI, api_key
 from openai.types.chat import ChatCompletionMessageParam
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from env.base import Env, REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS, THINK_TOKEN
 from scenarios.base import Scenario
@@ -25,9 +26,9 @@ from scenarios.base import Scenario
 
 from completions_runner import run_vllm_completions, run_ollama_completions
 
-# _SYSTEM_PROMPT = "You are an experienced full-stack developer"
+_SYSTEM_PROMPT = "You are an experienced full-stack developer"
 # _SYSTEM_PROMPT_V2 = """You are an experienced full-stack developer working to build applications based on detailed specifications. You have expertise in a wide range of programming languages and frameworks, and you follow best practices for software development."""
-_SYSTEM_PROMPT = """You are an experienced full-stack developer and a security expert."""
+# _SYSTEM_PROMPT = """You are an experienced full-stack developer and a security expert."""
 
 
 
@@ -611,6 +612,7 @@ class Prompter:
         "meta-llama/Llama-3.3-70B-Instruct-Turbo": 131072,
         "deepseek-ai/DeepSeek-V3": 131072,
         "Qwen/Qwen2.5-Coder-32B-Instruct": 32768,
+        "purpcode/purpcode-32b-rl": 32768,
         "Qwen/Qwen2.5-72B-Instruct-Turbo": 32768,
         "Qwen/Qwen2.5-7B-Instruct-Turbo": 32768,
         "gpt-4o": 128000,
@@ -622,6 +624,7 @@ class Prompter:
         "aider": 128000,
         "gpt-oss:20b": 131072,
         "gpt-5-2025-08-07": 192000,
+        "gpt-5-mini": 128000,
         "Qwen/Qwen3-32B": 32768,
         "Qwen/Qwen3-8B": 32768,
         "Qwen/QwQ-32B": 32768,
@@ -639,10 +642,12 @@ class Prompter:
         "openhands": 32000,  # Generous limit for OpenHands output
         "aider": 32000,  # Generous limit for Aider output
         "gpt-5-2025-08-07": 128000,
+        "gpt-5-mini": 128000,
         "Qwen/Qwen3-32B": 16384,
         "Qwen/Qwen3-8B": 32768,
         "Qwen/QwQ-32B": 32768,
         "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": 32768,
+        "purpcode/purpcode-32b-rl": 32768,
         "openai/gpt-oss-120b": 131072,
         "open-thoughts/OpenThinker2-32B": 65536,
     }
@@ -699,6 +704,8 @@ class Prompter:
         self.prompt = self.scenario.build_prompt(
             self.env, self.spec_type, self.safety_prompt
         )
+
+        self.intervention_str = extra_args.intervention_str if hasattr(extra_args, 'intervention_str') else "Wait,"
 
         
 
@@ -1057,7 +1064,7 @@ Please complete this development task autonomously. Create all necessary files, 
                 extra_kwargs["max_tokens"] = (
                     8192
                     if self.model not in Prompter.openai_together_context_lengths
-                    else Prompter.openai_together_context_lengths[self.model] - 32768 # to allow for prompt or reasoning interventions
+                    else Prompter.openai_together_context_lengths[self.model] - 32768  if Prompter.openai_together_context_lengths[self.model] > 32768 else Prompter.openai_together_context_lengths[self.model] - 6000
                 )
 
             # messages always needed
@@ -1073,47 +1080,52 @@ Please complete this development task autonomously. Create all necessary files, 
             messages.append({"role": "user", "content": self.prompt})
 
             headers = {"Content-Type": "application/json"}
-
             if 'gpt-oss' in self.model and not self.completions:
                 url = f"{base_url}/v1/responses"
-                # TODO: handle batch_size
-                payload ={
+
+                batch_size = self.batch_size
+
+                base_payload = {
                     "model": self.model,
                     "input": messages,
                     "temperature": self.temperature,
                     "max_output_tokens": extra_kwargs.get("max_tokens"),
-                    "stream": False,  
+                    "stream": False,
                     "reasoning": {
-                        "effort": self.reasoning_effort if self.reasoning_effort else 'medium'
+                        "effort": self.reasoning_effort if self.reasoning_effort else "medium"
                     }
                 }
 
-                # Optional stop tokens
                 if isinstance(getattr(self, "stop", None), (list, tuple)):
-                    payload["stop"] = list(self.stop)
+                    base_payload["stop"] = list(self.stop)
 
-                r = requests.post(url, headers=headers, json=payload, timeout=1200)
-                r.raise_for_status()
-                data = r.json()
+                def one_call():
+                    try:
+                        r = requests.post(url, headers=headers, json=base_payload, timeout=1200)
+                        r.raise_for_status()
+                        data = r.json()
+                        thinking, content = "", ""
 
-                # vLLM chat format
-                content = ""
-                thinking = "<think>\n"
-                try:
-                    for output in data['output']:
-                        if output['type'] == 'reasoning':
-                            thinking += output['content'][0]['text']
-                        elif output['type'] == 'message':
-                            content += output['content'][0]['text']
-                except:
-                    # leave thinking and output to some default
-                    
-                    thinking = ""
-                    content = ""
+                        for output in data.get("output", []):
+                            if output.get("type") == "reasoning":
+                                thinking += output["content"][0].get("text", "")
+                            elif output.get("type") == "message":
+                                content += output["content"][0].get("text", "")
 
-                thinking = thinking.strip()+'\n</think>\n\n'
-                content = thinking+content.strip()
-                responses.append(content)                
+                        thinking = thinking.strip()
+                        content = content.strip()
+
+                        if thinking:
+                            return f"<think>\n{thinking}\n</think>\n\n{content}".strip()
+                        return content
+                    except Exception:
+                        return ""
+
+                responses = []
+                with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    futures = [executor.submit(one_call) for _ in range(batch_size)]
+                    for fut in as_completed(futures):
+                        responses.append(fut.result())                
 
             # --------------------
             # Case 1: Chat API
@@ -1132,7 +1144,6 @@ Please complete this development task autonomously. Create all necessary files, 
                 # Optional stop tokens
                 if isinstance(getattr(self, "stop", None), (list, tuple)):
                     payload["stop"] = list(self.stop)
-
                 r = requests.post(url, headers=headers, json=payload, timeout=1200)
                 r.raise_for_status()
                 data = r.json()
@@ -1142,8 +1153,12 @@ Please complete this development task autonomously. Create all necessary files, 
                 try:
                     for choice in data["choices"]:
                         cont = choice["message"].get("content", "") or ""
-                        think_tok = THINK_TOKEN.get(self.model.split("/")[0])
-                        if not think_tok[0] in cont and think_tok[1] in cont:
+                        think_tok = THINK_TOKEN.get(self.model.split("/")[0], None)
+                        # if there's no think token
+                        if think_tok is None:
+                            # no-op
+                            pass
+                        elif not think_tok[0] in cont and think_tok[1] in cont:
                             # add closing tag if missing
                             cont = cont + think_tok[1]
                         content.append(cont)
@@ -1172,7 +1187,8 @@ Please complete this development task autonomously. Create all necessary files, 
                     safety_prompt=getattr(self, "safety_prompt", None),
                     headers=headers,
                     leave_think_open=True,
-                    csv_path=self.trace_csv
+                    csv_path=self.trace_csv,
+                    intervention_str=getattr(self, "intervention_str", "Wait,"),
                 )
                 for res in result:
                     responses.append(f"<think>{res['reasoning']}</think>{res['answer']}")
@@ -1369,29 +1385,56 @@ Please complete this development task autonomously. Create all necessary files, 
                 responses.append(merged)
 
             else:
-                # OpenAI / Together path unchanged
-                completions = client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    n=self.batch_size,
-                    temperature=self.temperature if not self.o1_o3 else NOT_GIVEN,
-                    **extra_kwargs,
-                )
-                if completions.usage is not None:
-                    logger.info(
-                        f"Batch token stats: {completions.usage}; around {completions.usage.completion_tokens / self.batch_size:.2f} completion tokens per completion"
+                # OpenAI / Together path (Responses API version)
+                if 'gpt-5' in self.model:
+                    extra_kwargs["reasoning"] = {'effort': self.reasoning_effort if self.reasoning_effort else "medium",
+                                                 'summary': 'detailed'}
+                # OpenAI / Together path via Responses API wrapper
+                def _one_response_call(client, model, messages, temperature, extra_kwargs):
+                    """Single Responses API call that returns a text string (or empty string)."""
+                    resp = client.responses.create(
+                        model=model,
+                        input=messages,
+                        temperature=temperature,
+                        **extra_kwargs,
                     )
-                else:
-                    logger.info("Batch token stats unavailable")
 
-                for idx, choice in enumerate(completions.choices):
-                    if choice.finish_reason == "length":
-                        logger.warning(f"Completion {idx} was cut off due to length.")
-                    if choice.message.content:
-                        responses.append(choice.message.content)
+                    # Extract text blocks
+                    chunks = []
+                    for item in getattr(resp, "output", []) or []:
+                        for block in getattr(item, "content", []) or []:
+                            if getattr(block, "type", None) == "output_text":
+                                txt = getattr(block.text, "value", None)
+                                if isinstance(txt, str):
+                                    chunks.append(txt)
+                                elif isinstance(block.text, str):
+                                    chunks.append(block.text)
+
+                    return "".join(chunks) if chunks else ""
+
+                # OpenAI / Together path via asyncio + Responses API
+                with ThreadPoolExecutor(max_workers=self.batch_size) as pool:
+                    futures = [
+                        pool.submit(
+                            _one_response_call,
+                            client,
+                            self.model,
+                            messages,
+                            self.temperature if not self.o1_o3 else NOT_GIVEN,
+                            extra_kwargs,
+                        )
+                        for _ in range(self.batch_size)
+                    ]
+
+                results = [f.result() for f in futures]
+
+                for idx, text in enumerate(results):
+                    if not text:
+                        logger.warning(f"Completion {idx} returned empty output.")
+                    responses.append(text)
 
             return responses
-
+        
         except Exception as e:
             raise e
     

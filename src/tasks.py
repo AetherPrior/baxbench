@@ -226,7 +226,6 @@ class Task:
                 openrouter,
             )
             return
-
         # check if this task has already been generated
         if (
             all(

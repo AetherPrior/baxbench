@@ -26,6 +26,7 @@ class ExtraArgs:
     vllm: Optional[bool] = False
     completions: Optional[bool] = False
     trace_csv: Optional[str] = None
+    intervention_str: Optional[str] = None
 
 
 def esc(text: str):
@@ -77,19 +78,19 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
 
 def main(args: argparse.Namespace) -> None:
 
-    def parse_kv_pairs(pairs: Optional[list[str]]) -> dict[str, Any]:
-        if not pairs:
-            return {}
-        out = {}
-        for pair in pairs:
-            key, value = pair.split("=", 1)
-            try:
-                out[key] = eval(value)  # convert numbers, bools, etc.
-            except Exception:
-                out[key] = value
-        return out
+    # def parse_kv_pairs(pairs: Optional[list[str]]) -> dict[str, Any]:
+    #     if not pairs:
+    #         return {}
+    #     out = {}
+    #     for pair in pairs:
+    #         key, value = pair.split("=", 1)
+    #         try:
+    #             out[key] = eval(value)  # convert numbers, bools, etc.
+    #         except Exception:
+    #             out[key] = value
+    #     return out
     
-    args.extra_args = parse_kv_pairs(args.extra_args)
+    # args.extra_args = parse_kv_pairs(args.extra_args)
     args.extra_args = ExtraArgs(**args.extra_args)
 
     # print all args
@@ -267,13 +268,6 @@ if __name__ == "__main__":
         help="The number of samples to generate or test. Will index from 0.",
     )
     parser.add_argument(
-        "--reasoning_effort",
-        type=str,
-        default=None,
-        choices=["low", "medium", "high"],
-        help="The reasoning effort to use for reasoning models.",
-    )
-    parser.add_argument(
         "--only_samples",
         type=int,
         nargs="+",
@@ -387,8 +381,53 @@ if __name__ == "__main__":
     #     action="store_true",
     #     help="Use VLLM for inferencing (for local models only)"
     # )
-    parser.add_argument("--extra_args", nargs="*", default={}, type=str,
-                    help='Extra args like key=value pairs')
+    extra_parser = argparse.ArgumentParser(add_help=False)
+    extra_parser.add_argument(
+        "--reasoning_effort", type=str, choices=["low", "medium", "high"]
+    )
+    extra_parser.add_argument(
+        "--max_thinking_tokens", type=int, default=None, help="Maximum thinking budget for LLMs"
+    )
+    extra_parser.add_argument(
+        "--openhands_timeout", type=int, default=300, help="Timeout for OpenHands agents"
+    )
+    extra_parser.add_argument(
+        "--openhands_max_iterations", type=int, default=50, help="Max iterations for    OpenHands agents"
+    )
+    extra_parser.add_argument(
+        "--agent_port", type=int, default=None, help="Port for agent server"
+    ) 
+    extra_parser.add_argument(
+        "--container", type=str, default=None, help="Docker container ID"
+    )
+    extra_parser.add_argument(
+        "--llm_model", type=str, default=None, help="LLM model to use for agents that support it (e.g., 'gpt-4o', 'gpt-5-mini-2025-08-07')"
+    )
+    extra_parser.add_argument(
+        "--vllm", action="store_true", help="Use VLLM for inferencing (for local models only)"
+    )
+    extra_parser.add_argument(
+        "--completions", action="store_true", help="Use completions API instead of chat completions"
+    )
+    extra_parser.add_argument(
+        "--trace_csv", type=str, default=None, help="Path to trace CSV for interventions"
+    )
+    extra_parser.add_argument(
+        "--intervention_str", type=str, default="Wait,", help="Intervention string to insert"
+    )
+    # extra_parser.add_argument(
+    #     "--extra_args",
+    #     type=str,
+    #     nargs="+",
+    #     default=None,
+    #     help="Additional extra args as key=value pairs",
+    # )
+    args, remaining = parser.parse_known_args()
+    extra_args, _ = extra_parser.parse_known_args(remaining)
+    for key, value in vars(extra_args).items():
+        if not hasattr(args, "extra_args"):
+            args.extra_args = {}
+        args.extra_args[key] = value
 
-
-    main(parser.parse_args())
+    # breakpoint()
+    main(args)

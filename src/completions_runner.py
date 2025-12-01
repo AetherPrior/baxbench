@@ -14,7 +14,7 @@ from thinking_budget_enforcer import run_vllm_enforced_completions
 
 from env.base import REASONING_EFFORT_MODELS, REASONING_TOKENS_MODELS, THINK_TOKEN
 
-class CompletionsResult(TypedDict):
+class CompletionsItem(TypedDict):
     prompt: str                 # full prompt sent to vLLM (for logging/debug)
     raw: str                    # raw text returned by vLLM
     reasoning: str              # merged: injected trace + generated continuation (until </think> OR before <|channel|>final)
@@ -22,6 +22,7 @@ class CompletionsResult(TypedDict):
     model_family: str           # 'gpt-oss' | 'qwen' | 'deepseek-qwen'
     stop: Optional[List[str]]   # stop strings sent to vLLM
 
+CompletionsResult = List[CompletionsItem]
 
 def run_vllm_completions(
     *,
@@ -41,6 +42,7 @@ def run_vllm_completions(
     headers: Optional[Dict[str, str]] = None,
     leave_think_open: bool = False,   
     timeout: int = 1200,
+    intervention_str: str = "Wait,"
 ) -> CompletionsResult:
     """
     vLLM /v1/completions runner with manual chat formatting and robust reasoning/answer split.
@@ -72,7 +74,7 @@ def run_vllm_completions(
             headers=headers,
             leave_think_open=leave_think_open,
             timeout=timeout,
-            thinking_budget_max_retries=3
+            intervention_str=intervention_str
         )
 
     # 1) Trace lookup (CSV -> file -> None)

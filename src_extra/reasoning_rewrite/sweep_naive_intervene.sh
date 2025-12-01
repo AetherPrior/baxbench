@@ -8,9 +8,9 @@ SPEC='openapi'
 REASONING='high'
 ENVS=('Python-Django' 'Python-Flask' 'Python-aiohttp' 'Python-FastAPI')
 # ENVS=('Rust-Actix' 'Go-Fiber' 'Python-Django' 'Python-FastAPI')
-PROMPTS=('none')   # safety_prompt values
-MODES=('generate' 'test' 'evaluate')
-THINKING_BUDGETS=('2000' '4000' '6000' '8000')
+PROMPTS=('generic')   # safety_prompt values
+MODES=('test' 'evaluate')
+THINKING_BUDGETS=('10000' '12000')
 
 export LOCAL_API_BASE="http://localhost:8000"
 
@@ -30,7 +30,12 @@ run_main() {
     --results_dir "${outdir}" \
     --timeout 55 \
     --envs $(join_by ' ' "${ENVS[@]}") \
-    --extra_args vllm=True reasoning_effort=high completions=True max_thinking_tokens=${thinking_budget} trace_csv=${PARENT_DIR}/no_op/${MODEL//\//-}_${REASONING}_all_no_op_intervention.csv
+    --vllm \
+    --force \
+    --reasoning_effort=high \
+    --completions \
+    --max_thinking_tokens=${thinking_budget} \
+    --trace_csv=${PARENT_DIR}/no_op/${MODEL//\//-}_${REASONING}_all_no_op_generic_intervention.csv
     # --envs $(join_by ' ' "${ENVS[@]}") \
 }
 
@@ -54,12 +59,12 @@ gather_for_prompt() {
 
 main() {
   for prompt in "${PROMPTS[@]}"; do
-    # for mode in "${MODES[@]}"; do
-    #   for THINKING_BUDGET in "${THINKING_BUDGETS[@]}"; do
-    #     echo "==> ${prompt} :: ${mode} :: budget ${THINKING_BUDGET}"
-    #     run_main "${mode}" "${prompt}" "${THINKING_BUDGET}"
-    #   done
-    # done
+    for mode in "${MODES[@]}"; do
+      for THINKING_BUDGET in "${THINKING_BUDGETS[@]}"; do
+        echo "==> ${prompt} :: ${mode} :: budget ${THINKING_BUDGET}"
+        run_main "${mode}" "${prompt}" "${THINKING_BUDGET}"
+      done
+    done
     for THINKING_BUDGET in "${THINKING_BUDGETS[@]}"; do
       echo "==> gather ${prompt}"
       gather_for_prompt "${prompt}" "${THINKING_BUDGET}"
@@ -67,25 +72,30 @@ main() {
   done
 }
 
-# main
+main
 
 # If you kept the same vars/functions from earlier:
 # PARENT_DIR, MODEL, TEMP, SPEC, REASONING, ENVS[], EXTRA_ARGS, BASE_ENV, join_by()
+# wrap this in if false block
+if false; then
+
 FINAL_PROMPT='generic'                 # safety_prompt for this phase
 
 # give higher token budgets 
-for max_tokens in 2000 4000 6000 8000; do
+for max_tokens in '2000' '4000' '6000' '8000' '10000' '12000'; do
   FINAL_TAG="final_reminder"          # results subdir + CSV location
 
   final_json="${PARENT_DIR}/${FINAL_TAG}_${max_tokens}/overall_results_${MODEL//\//-}_${TEMP}_${SPEC}_${FINAL_PROMPT}_${REASONING}.json"
   final_csv="${PARENT_DIR}/${FINAL_TAG}_${max_tokens}/${MODEL//\//-}_${REASONING}_all_${FINAL_TAG}_intervention.csv"
   final_outdir="${PARENT_DIR}/${FINAL_TAG}_${max_tokens}"
 
-  # 1) Extract and add suffixes to intervention traces
-  pipenv run python src_extra/reasoning_rewrite/extract_and_add_suffix.py \
-    --type "${FINAL_TAG}" \
-    --parent_dir "${PARENT_DIR}" \
-    --max_tokens "${max_tokens}"
+  # # 1) Extract and add suffixes to intervention traces
+  # pipenv run python src_extra/reasoning_rewrite/extract_and_add_suffix.py \
+  #   --type "${FINAL_TAG}" \
+  #   --parent_dir "${PARENT_DIR}" \
+  #   --max_tokens "${max_tokens}" \
+  #   --in_file "${PARENT_DIR}/${FINAL_PROMPT}/${MODEL//\//-}_${REASONING}_all_analysis.csv" \
+  #   --out_file "${PARENT_DIR}/${FINAL_TAG}_${max_tokens}/${MODEL//\//-}_${REASONING}_all_${FINAL_TAG}_intervention.csv"
 
   # 2) Run intervene sweeps (generate → test → evaluate)
   for mode in generate test evaluate; do
@@ -101,9 +111,14 @@ for max_tokens in 2000 4000 6000 8000; do
       --results_dir "${final_outdir}"  \
       --timeout 55 \
       --envs $(join_by ' ' "${ENVS[@]}") \
-      --extra_args vllm=True reasoning_effort=high completions=True trace_csv=${final_csv} # max_thinking_tokens="${max_tokens}" -- don't provide token budgets here though, the idea is intervention
-      # --envs $(join_by ' ' "${ENVS[@]}") \
-      # --force \
+      --vllm \
+      --reasoning_effort "high" \
+      --completions \
+      --trace_csv=${final_csv} \
+      --max_thinking_tokens=${max_tokens} \
+      --trace_csv=${PARENT_DIR}/no_op/${MODEL//\//-}_${REASONING}_all_no_op_generic_intervention.csv \
+      --intervention_str "But wait, we need to handle security as well:" \
+      --force
       #
   done
   pipenv run python src_extra/gather_all_files.py \
@@ -118,6 +133,7 @@ for max_tokens in 2000 4000 6000 8000; do
   --models "${MODEL//\//-}_${REASONING}"
 
 done 
+fi 
 
 # # # 3) Gather all files and traces for final_reminder
 # # pipenv run python src_extra/gather_all_files.py \

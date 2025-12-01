@@ -106,7 +106,8 @@ def run_vllm_enforced_completions(
     headers: Optional[Dict[str, str]] = None,
     leave_think_open: bool = False,
     timeout: int = 1200,
-    thinking_budget_max_retries: int = 3,   # NEW: per-generation max retries
+    thinking_budget_max_retries: int = 6,   # NEW: per-generation max retries
+    intervention_str = "Wait,"
 ) -> CompletionsResult:
     """
     vLLM /v1/completions runner with token-budgeted reasoning control.
@@ -124,6 +125,7 @@ def run_vllm_enforced_completions(
       - Different generations may receive different interventions.
       - Works with GPT-OSS (channels) and Qwen/DeepSeek (</think>) via your manual formatters.
     """
+    # breakpoint()
     # 1) Trace lookup (CSV -> file -> None)
     analysis_trace: Optional[str] = None
     if csv_path:
@@ -142,7 +144,10 @@ def run_vllm_enforced_completions(
             )
         except Exception:
             analysis_trace = None
+            breakpoint()
 
+    if analysis_trace is None:
+        breakpoint()
     # Optional: budget injected trace length upfront (simple hard cap)
     if analysis_trace and max_thinking_tokens and max_thinking_tokens > 0:
         analysis_trace, trimmed = trim_to_budget(analysis_trace, max_thinking_tokens, model)
@@ -226,7 +231,7 @@ def run_vllm_enforced_completions(
             elif r_tokens < max_thinking_tokens:
                 # New injected analysis trace is the *current model reasoning* plus a nudge
                 # (without closing tag); formatter will keep it open.
-                next_injected_trace = (current_reasoning.rstrip() + "\n\nWait,").strip()
+                next_injected_trace = (current_reasoning.rstrip() + f"\n\n{intervention_str}").strip()
                 next_formatted_prompt = _format_prompt_for_family(
                     family=family,
                     formatter=formatter,
@@ -262,7 +267,8 @@ def run_vllm_enforced_completions(
         # OVER budget: trim to budget & close
         if r_tokens > max_thinking_tokens:
             analysis_trace, trimmed = trim_to_budget(current_reasoning, max_thinking_tokens, model)
-        
+        else:
+            analysis_trace = current_reasoning
         # Close the think channel/tag by forcing leave_think_open=False
         next_formatted_prompt = _format_prompt_for_family(
             family=family,
